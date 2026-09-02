@@ -4,7 +4,7 @@ description: Worker implementation running as a self-driving Claude Code session
 extends: worker
 cli: claude
 model: ${PI_SUBAGENT_MODEL_WORKER_CLAUDE:-${PI_SUBAGENT_MODEL}}
-effort: medium
+effort: low
 spawning: false
 auto-exit: true
 ---

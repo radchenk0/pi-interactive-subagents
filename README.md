@@ -18,8 +18,8 @@ Call `subagent()` and it **returns immediately**. The sub-agent runs in its own 
 For parallel execution, just call `subagent` multiple times — they all run concurrently:
 
 ```typescript
-subagent({ name: "Scout: Auth", agent: "scout", task: "Analyze auth module" });
-subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
+subagent({ name: "Worker: Auth", agent: "pi-worker", task: "Implement auth module" });
+subagent({ name: "Worker: DB", agent: "pi-worker", task: "Map database schema" });
 // Both return immediately, results steer back independently
 ```
 
@@ -104,13 +104,16 @@ For richer herdr integration (authoritative lifecycle states + native session re
 
 ### Bundled Agents
 
-| Agent             | Model                  | Role                                                                                     |
-| ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| Agent            | Runs as        | Role                                                                                          |
+| ---------------- | -------------- | --------------------------------------------------------------------------------------------- |
+| **planner**      | pi (interactive) | In-pane planner — interviews the user (goal → decisions) then writes a `spec.md` + sliced `plan.md`; never implements |
+| **pi-worker**    | pi subagent    | Implements a well-scoped task — writes code, runs tests, verifies with evidence; extends the abstract `worker` base |
+| **worker-claude**| Claude Code    | Same worker role/standards as `pi-worker`, executed by the `claude` CLI; extends the abstract `worker` base |
+| **reviewer**     | pi subagent    | Reviews code for bugs, security issues, correctness                                          |
+| **researcher**   | pi subagent    | Web research — searches and synthesizes findings into a sourced brief                          |
+| **tester**       | pi subagent    | QA — backend tests (unit/integration/API) + frontend via Playwright MCP; P0-P3 reports         |
+
+`worker` itself is an **abstract base** (`disable-model-invocation: true`) shared by `pi-worker` and `worker-claude` via the `extends:` frontmatter — spawn a concrete implementation, not the base.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 

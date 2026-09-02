@@ -1,7 +1,7 @@
 ---
 name: test-echo
 description: Integration test agent — completes simple file-writing tasks
-model: anthropic/claude-haiku-4-5
+model: vllm/qwen3.8-27b-fp8
 tools: read, bash, write, edit
 spawning: false
 auto-exit: true

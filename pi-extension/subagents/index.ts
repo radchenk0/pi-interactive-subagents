@@ -167,6 +167,7 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   denyTools?: string;
+  extends?: string;
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
@@ -230,6 +231,76 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+// ---------------------------------------------------------------------------
+// .env + ${VAR} / ${VAR:-default} interpolation for agent frontmatter
+// ---------------------------------------------------------------------------
+
+let dotEnvLoaded = false;
+
+/**
+ * Parse a minimal .env file (KEY=VALUE lines, # comments, optional quotes)
+ * into `env`. Never overrides variables that are already set —
+ * the real environment wins over .env files.
+ */
+export function loadDotEnvFile(file: string, env: NodeJS.ProcessEnv = process.env): void {
+  let content: string;
+  try {
+    content = readFileSync(file, "utf8");
+  } catch {
+    return; // no file — fine
+  }
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith("\"") && value.endsWith("\"")) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key && env[key] === undefined) env[key] = value;
+  }
+}
+
+/**
+ * Load .env from the project (cwd) and the global agent config dir.
+ * Cached — the extension lives for the whole session.
+ */
+export function loadAgentDotEnv(): void {
+  if (dotEnvLoaded) return;
+  dotEnvLoaded = true;
+  loadDotEnvFile(join(process.cwd(), ".env"));
+  loadDotEnvFile(join(getAgentConfigDir(), ".env"));
+}
+
+/**
+ * Substitute ${VAR} and ${VAR:-default} in a frontmatter value from
+ * process.env. Unset ${VAR} becomes an empty string. Repeats until stable
+ * so nested defaults work: ${A:-${B:-fallback}}.
+ */
+export function interpolateEnvVars(value: string): string {
+  const sub = (v: string): string =>
+    v.replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?\}/g,
+      (_whole, name: string, def?: string) => {
+        const val = process.env[name];
+        if (val !== undefined && val !== "") return val;
+        return def ?? "";
+      },
+    );
+  let out = value;
+  for (let i = 0; i < 8 && out.includes("${"); i++) {
+    const next = sub(out);
+    if (next === out) break; // no ${...} resolvable anymore
+    out = next;
+  }
+  return out;
+}
+
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
 }
@@ -253,31 +324,36 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
+  loadAgentDotEnv();
 
   const frontmatter = match[1];
   const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  // Env-aware frontmatter values, e.g. model: ${PI_SUBAGENT_MODEL_PI_WORKER:-vllm/...}
+  const envValue = (v: string | undefined): string | undefined =>
+    v === undefined ? v : interpolateEnvVars(v);
 
   return {
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
+    model: envValue(getFrontmatterValue(frontmatter, "model")),
+    tools: envValue(getFrontmatterValue(frontmatter, "tools")),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
         : systemPromptMode === "append"
           ? "append"
           : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    skills: envValue(getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills")),
+    thinking: envValue(getFrontmatterValue(frontmatter, "thinking")),
+    denyTools: envValue(getFrontmatterValue(frontmatter, "deny-tools")),
+    extends: getFrontmatterValue(frontmatter, "extends"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
-    cwd: getFrontmatterValue(frontmatter, "cwd"),
-    cli: getFrontmatterValue(frontmatter, "cli"),
+    cwd: envValue(getFrontmatterValue(frontmatter, "cwd")),
+    cli: envValue(getFrontmatterValue(frontmatter, "cli")),
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
@@ -386,7 +462,10 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string, visited: Set<string> = new Set()): AgentDefaults | null {
+  if (visited.has(agentName)) return null; // cycle guard for `extends` chains
+  visited.add(agentName);
+
   const configDir = getAgentConfigDir();
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
@@ -397,10 +476,42 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   for (const p of paths) {
     if (!existsSync(p)) continue;
     const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
-    if (parsed) return parsed;
+    if (parsed) return resolveAgentExtends(parsed, visited);
   }
 
   return null;
+}
+
+/**
+ * Resolve `extends: <base>` on an agent definition (OOP-style: the base file
+ * is the abstract role, derived files add implementation-specific notes).
+ * The derived file overrides any field it sets; the base body is prepended to
+ * the derived body, so a derived agent = base role + its own notes.
+ */
+function resolveAgentExtends(def: AgentDefinition, visited: Set<string>): AgentDefinition {
+  const baseName = def.extends?.trim();
+  if (!baseName) return def;
+
+  const base = loadAgentDefaults(baseName, visited);
+  if (!base) {
+    // Unknown base: proceed with the derived definition only (better than failing spawn).
+    return def;
+  }
+
+  const override: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(def)) {
+    if (value !== undefined) override[key] = value;
+  }
+
+  return {
+    ...base,
+    ...override,
+    extends: undefined,
+    body:
+      base.body && def.body
+        ? `${base.body}\n\n---\n\n## Implementation Notes\n\n${def.body}`
+        : base.body ?? def.body,
+  };
 }
 
 function formatElapsed(seconds: number): string {
@@ -950,6 +1061,9 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  parseAgentDefinition,
+  interpolateEnvVars,
+  loadDotEnvFile,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,

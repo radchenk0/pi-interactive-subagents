@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -946,6 +946,89 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("resolves agent `extends` — derived overrides base, base body is prepended", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      // Base (abstract) in the global dir, derived in the project dir —
+      // also proves extends resolves across the search-path boundaries.
+      writeAgentFile(
+        globalAgentsDir,
+        "test-base-worker",
+        [
+          "name: test-base-worker",
+          "model: anthropic/base-model",
+          "thinking: high",
+          "auto-exit: true",
+        ].join("\n"),
+        "BASE ROLE: execute with care.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "test-pi-worker",
+        [
+          "name: test-pi-worker",
+          "extends: test-base-worker",
+          "model: vllm/derived-model",
+        ].join("\n"),
+        "DERIVED: pi-specific notes.",
+      );
+
+      const derived = testApi.loadAgentDefaults("test-pi-worker");
+      assert.ok(derived);
+      // Derived overrides win
+      assert.equal(derived.name, "test-pi-worker");
+      assert.equal(derived.model, "vllm/derived-model");
+      // Unset fields inherit from the base
+      assert.equal(derived.thinking, "high");
+      assert.equal(derived.autoExit, true);
+      // Body = base role + implementation notes
+      assert.ok(derived.body!.startsWith("BASE ROLE: execute with care."));
+      assert.ok(derived.body!.includes("## Implementation Notes"));
+      assert.ok(derived.body!.includes("DERIVED: pi-specific notes."));
+    });
+  });
+
+  it("resolves agent `extends` with unknown base to the derived definition only", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "test-orphan-derived",
+        [
+          "name: test-orphan-derived",
+          "extends: does-not-exist",
+          "model: vllm/orphan",
+        ].join("\n"),
+        "ORPHAN BODY.",
+      );
+
+      const derived = testApi.loadAgentDefaults("test-orphan-derived");
+      assert.ok(derived);
+      assert.equal(derived.model, "vllm/orphan");
+      assert.equal(derived.body, "ORPHAN BODY.");
+    });
+  });
+
+  it("survives an `extends` cycle without hanging", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "test-cycle-a",
+        ["name: test-cycle-a", "extends: test-cycle-b", "model: vllm/a"].join("\n"),
+        "A BODY.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "test-cycle-b",
+        ["name: test-cycle-b", "extends: test-cycle-a", "model: vllm/b"].join("\n"),
+        "B BODY.",
+      );
+
+      const a = testApi.loadAgentDefaults("test-cycle-a");
+      assert.ok(a);
+      assert.equal(a.model, "vllm/a");
+      assert.ok(a.body!.includes("A BODY."));
+    });
+  });
+
   it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
     // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
     assert.equal(
@@ -1004,8 +1087,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
+  it("bundled concrete worker/reviewer/tester/researcher agents resolve as non-interactive; planner resolves as interactive", () => {
+    for (const name of ["pi-worker", "reviewer", "tester", "researcher"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -2824,5 +2907,113 @@ describe("herdr-native.ts", () => {
       });
       assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
     });
+  });
+});
+
+describe("agent frontmatter env interpolation", () => {
+  const { interpolateEnvVars, loadDotEnvFile, parseAgentDefinition } =
+    (subagentsModule as any).__test__;
+  const saved: Record<string, string | undefined> = {};
+  const vars = ["PI_SUBAGENT_MODEL", "PI_SUBAGENT_MODEL_PLANNER", "MY_TEST_VAR"];
+  const cleanup = () => {
+    for (const k of vars) delete process.env[k];
+  };
+
+  it("substitutes ${VAR} from the environment", () => {
+    process.env.MY_TEST_VAR = "acme/test-model-1";
+    try {
+      assert.equal(interpolateEnvVars("${MY_TEST_VAR}"), "acme/test-model-1");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to the default when the variable is unset", () => {
+    cleanup();
+    assert.equal(
+      interpolateEnvVars("${PI_SUBAGENT_MODEL:-acme/fallback-model}"),
+      "acme/fallback-model",
+    );
+  });
+
+  it("resolves nested defaults left to right", () => {
+    cleanup();
+    assert.equal(
+      interpolateEnvVars(
+        "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
+      ),
+      "acme/fallback-model",
+    );
+    process.env.PI_SUBAGENT_MODEL = "acme/mid-model";
+    try {
+      assert.equal(
+        interpolateEnvVars(
+          "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
+        ),
+        "acme/mid-model",
+      );
+      process.env.PI_SUBAGENT_MODEL_PLANNER = "acme/agent-model";
+      assert.equal(
+        interpolateEnvVars(
+          "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
+        ),
+        "acme/agent-model",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("leaves plain values untouched", () => {
+    assert.equal(interpolateEnvVars("plain-model"), "plain-model");
+    assert.equal(interpolateEnvVars("acme/fallback-model"), "acme/fallback-model");
+  });
+
+  it("parses .env files without overriding the real environment", () => {
+    const env: NodeJS.ProcessEnv = {};
+    env.EXISTING = "real";
+    const file = `${tmpdir()}/pi-subagents-env-test-${Date.now()}.env`;
+    writeFileSync(
+      file,
+      [
+        "# comment",
+        "",
+        "PI_SUBAGENT_MODEL=acme/fallback-model",
+        'QUOTED="hello world"',
+        "EXISTING=from-file",
+        "BROKEN LINE",
+        "=novalue",
+        "PI_SUBAGENT_MODEL_PLANNER=acme/agent-model",
+      ].join("\n"),
+    );
+    try {
+      loadDotEnvFile(file, env);
+      assert.equal(env.PI_SUBAGENT_MODEL, "acme/fallback-model");
+      assert.equal(env.QUOTED, "hello world");
+      assert.equal(env.EXISTING, "real"); // real env wins
+      assert.equal(env.PI_SUBAGENT_MODEL_PLANNER, "acme/agent-model");
+    } finally {
+      unlinkSync(file);
+    }
+  });
+
+  it("resolves models from env in parseAgentDefinition", () => {
+    cleanup();
+    process.env.PI_SUBAGENT_MODEL = "acme/test-model-2";
+    try {
+      const def = parseAgentDefinition(
+        [
+          "---",
+          "name: test-agent",
+          "model: ${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
+          "---",
+          "body text",
+        ].join("\n"),
+        "fallback",
+      );
+      assert.equal(def?.model, "acme/test-model-2");
+    } finally {
+      cleanup();
+    }
   });
 });

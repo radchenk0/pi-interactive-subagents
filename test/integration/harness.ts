@@ -26,9 +26,9 @@ import {
   getMuxBackend,
   createSurface,
   createSurfaceSplit,
-  sendCommand,
-  sendLongCommand,
-  readScreen,
+  sendCommand as sendCommandRaw,
+  sendLongCommand as sendLongCommandRaw,
+  readScreen as readScreenRaw,
   readScreenAsync,
   closeSurface,
   sendEscape,
@@ -42,15 +42,71 @@ import {
 export {
   createSurface,
   createSurfaceSplit,
-  sendCommand,
-  sendLongCommand,
-  readScreen,
   readScreenAsync,
   closeSurface,
   sendEscape,
   shellEscape,
 };
 export type { MuxBackend };
+
+/**
+ * herdr: `pane read --source detection` can transiently return a truncated
+ * output block when the read lands mid-repaint. Read twice and keep the
+ * longer capture.
+ */
+export function readScreen(surface: string, lines = 50): string {
+  if (getMuxBackend() !== "herdr") return readScreenRaw(surface, lines);
+  const first = readScreenRaw(surface, lines);
+  syncSleep(200);
+  const second = readScreenRaw(surface, lines);
+  return (second.length > first.length ? second : first);
+}
+
+// ── herdr shell-readiness guards ──
+
+/** Blocking sleep for synchronous pre-send checks. */
+function syncSleep(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * herdr: wait until the pane's shell has reached an idle prompt before
+ * typing a command. `pane run` types into the shell — if zsh is still
+ * loading rc files, typed characters interleave with rc output and the
+ * command (and its output prefix) gets mangled. Returns once the screen
+ * content stabilizes, or after timeoutMs.
+ */
+export function ensureHerdrShellReady(surface: string, timeoutMs = 8000): boolean {
+  if (getMuxBackend() !== "herdr") return true;
+  const start = Date.now();
+  let last = "";
+  while (Date.now() - start < timeoutMs) {
+    syncSleep(250);
+    let current: string;
+    try {
+      current = readScreen(surface, 5);
+    } catch {
+      continue;
+    }
+    if (current && current === last && Date.now() - start >= 600) return true;
+    last = current;
+  }
+  return false;
+}
+
+export function sendCommand(surface: string, command: string): void {
+  ensureHerdrShellReady(surface);
+  sendCommandRaw(surface, command);
+}
+
+export function sendLongCommand(
+  surface: string,
+  command: string,
+  options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  ensureHerdrShellReady(surface);
+  return sendLongCommandRaw(surface, command, options);
+}
 
 // ── Paths ──
 
@@ -89,7 +145,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "herdr", "tmux", "zellij"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -121,6 +177,34 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // herdr has no direct "focus pane X" command — move focus one step in the
+    // direction where the target sits relative to the current pane.
+    // Note: use explicit --pane ids; --current resolves against the FOCUSED
+    // pane, not the calling client's pane.
+    const current = herdrJson(["pane", "current"])?.pane?.pane_id ?? null;
+    if (current === surface) return;
+    for (const direction of ["left", "right", "up", "down"] as const) {
+      try {
+        const out = execFileSync(
+          "herdr",
+          ["pane", "neighbor", "--pane", current, "--direction", direction],
+          { encoding: "utf8" },
+        );
+        const neighbor = (JSON.parse(out) as {
+          result?: { neighbor?: { neighbor_pane_id?: string } };
+        })?.result?.neighbor?.neighbor_pane_id;
+        if (neighbor === surface) {
+          execFileSync("herdr", ["pane", "focus", "--pane", current, "--direction", direction], {
+            encoding: "utf8",
+          });
+          return;
+        }
+      } catch {}
+    }
+    throw new Error(`herdr: cannot focus pane ${surface} from ${current} (not a direct neighbor)`);
+  }
+
   if (backend === "tmux") {
     execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
     return;
@@ -133,6 +217,18 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
   if (backend === "cmux") {
     const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
     return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
+  }
+
+  if (backend === "herdr") {
+    try {
+      const out = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
+      const panes = (JSON.parse(out) as {
+        result?: { panes?: { pane_id?: string; focused?: boolean }[] };
+      })?.result?.panes ?? [];
+      return panes.find((p) => p.focused)?.pane_id ?? null;
+    } catch {
+      return null;
+    }
   }
 
   if (backend === "tmux") {
@@ -156,9 +252,20 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
     return parseCmuxPaneRefForSurfaceFromJson(info, surface);
   }
 
-  if (backend === "tmux") return surface;
+  if (backend === "herdr" || backend === "tmux") return surface;
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
+}
+
+/** Parse a herdr CLI JSON response into the unwrapped result object (or null). */
+function herdrJson(args: string[]): { pane?: { pane_id?: string } } | null {
+  try {
+    const out = execFileSync("herdr", args, { encoding: "utf8" });
+    const envelope = JSON.parse(out) as { result?: { pane?: { pane_id?: string } } };
+    return envelope.result ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export async function waitForFocusedSurface(
@@ -233,9 +340,13 @@ export function cleanupTestEnv(env: TestEnv): void {
 
 /**
  * Create a surface and register it for automatic cleanup.
+ *
+ * herdr: right splits halve the pane width every time, which wraps short
+ * marker strings and breaks screen assertions. Down splits keep the full
+ * width, so herdr test surfaces always split downward.
  */
 export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+  const surface = env.backend === "herdr" ? createSurfaceSplit(name, "down") : createSurface(name);
   env.surfaces.push(surface);
   return surface;
 }
@@ -246,7 +357,9 @@ export function createTrackedSurfaceSplit(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
+  // herdr only supports right/down; map everything to down (full width).
+  const effective = env.backend === "herdr" ? "down" : direction;
+  const surface = createSurfaceSplit(name, effective, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }

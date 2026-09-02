@@ -32,14 +32,19 @@ pi install git:github.com/HazAT/pi-interactive-subagents
 Supported multiplexers:
 
 - [cmux](https://github.com/manaflow-ai/cmux)
+- [herdr](https://github.com/herdr) (raw panes over a local socket server)
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+
+> **Note:** herdr runs *on top of* tmux (the `TMUX` env is set inside herdr), so detection tries herdr **before** tmux to avoid picking the wrong backend.
 
 Start pi inside one of them:
 
 ```bash
 cmux pi
+# or
+herdr        # then run: pi
 # or
 tmux new -A -s pi 'pi'
 # or
@@ -48,7 +53,7 @@ zellij --session pi   # then run: pi
 # just run pi inside WezTerm — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|herdr|tmux|zellij|wezterm` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,7 +61,27 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (cmux, herdr, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+
+### Herdr native agent API
+
+When running under [herdr](https://herdr.dev), subagents use herdr's server-side agent API instead of screen scraping:
+
+- **Completion detection** — `pane wait-output` searches the terminal snapshot and polls server-side for the exit sentinel (no client-side screen-read loop).
+- **Interrupts** — sent via `agent send-keys <pane> esc` (herdr-validated key).
+- **Naming & visibility** — the subagent's pane is renamed (`agent rename`) and gets a title/display name from the task (`pane report-metadata`), so herdr's agent UI shows `e2e-slow · running…` instead of an anonymous shell.
+- **Session identity** — the pi session file is bound via `pane report-agent-session`, so herdr can restore the pane after a server restart.
+- **Status** — herdr's `agent_status` (`working`/`idle`/`blocked`) is shown in the subagents widget next to each entry.
+
+This is **on by default** when the herdr backend is detected. Opt out with:
+
+```bash
+export PI_SUBAGENT_HERDR_NATIVE=0
+```
+
+Every native call degrades to the raw pane path (with a one-line warning) if herdr is old or the call fails — subagent results are never affected.
+
+For richer herdr integration (authoritative lifecycle states + native session restore), install herdr's official pi integration: `herdr integration install pi`.
 
 ## What's Included
 

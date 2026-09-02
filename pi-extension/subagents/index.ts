@@ -53,6 +53,36 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  applyHerdrAgentIdentity,
+  herdrNativeEnabled,
+  nativeAgentStatusMap,
+  nativeSendEscape,
+  nativeWaitSentinel,
+} from "./herdr-native.ts";
+
+/**
+ * One-line warning when the native herdr path degrades to the raw path.
+ */
+let nativeFallbackWarned = false;
+function nativeSlowPathFor(surface: string): Promise<{ exitCode: number } | null> {
+  return nativeWaitSentinel(surface, 1500).catch((error: any) => {
+    if (!nativeFallbackWarned) {
+      nativeFallbackWarned = true;
+      console.warn(`[subagents] herdr native wait-output failed, using screen reads: ${error?.message ?? error}`);
+    }
+    throw error;
+  });
+}
+
+/** Fire-and-forget herdr display identity (display only, never blocks). */
+function applyHerdrIdentityIfEnabled(
+  surface: string,
+  opts: { displayName?: string; taskId: string; task?: string; sessionFile?: string },
+): void {
+  if (!herdrNativeEnabled()) return;
+  void applyHerdrAgentIdentity(surface, opts).catch(() => {});
+}
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -506,6 +536,8 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
+  /** herdr-reported agent state (working/idle/blocked/...) — display only. */
+  agentStatus?: string;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -606,7 +638,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
-    const left = ` ${elapsed}  ${agent.name}${agentTag} `;
+    const herdrTag = agent.agentStatus ? ` · ${agent.agentStatus}` : "";
+    const left = ` ${elapsed}  ${agent.name}${agentTag}${herdrTag} `;
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
@@ -773,9 +806,19 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
+/**
+ * Default interrupt key sender. With the native herdr API enabled, prefers
+ * herdr's validated `agent send-keys esc`; falls back to raw pane send-keys
+ * on any failure (nativeSendEscape returns false).
+ */
+function sendInterruptKey(surface: string): void {
+  if (herdrNativeEnabled() && nativeSendEscape(surface)) return;
+  sendEscape(surface);
+}
+
 function requestSubagentInterrupt(
   running: RunningSubagent,
-  sendEscapeKey: (surface: string) => void = sendEscape,
+  sendEscapeKey: (surface: string) => void = sendInterruptKey,
 ): { ok: true } | { error: string } {
   try {
     sendEscapeKey(running.surface);
@@ -792,7 +835,7 @@ function requestSubagentInterrupt(
 
 function handleSubagentInterrupt(
   params: { id?: string; name?: string },
-  sendEscapeKey: (surface: string) => void = sendEscape,
+  sendEscapeKey: (surface: string) => void = sendInterruptKey,
 ) {
   const resolved = resolveInterruptTarget(params);
   if ("error" in resolved) {
@@ -850,6 +893,15 @@ function startStatusRefresh(pi: ExtensionAPI) {
     const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
+
+    // Display-only: refresh herdr-reported agent states (working/idle/blocked)
+    // for the widget. One local-socket CLI call; failures are no-ops.
+    if (herdrNativeEnabled()) {
+      const statusMap = nativeAgentStatusMap();
+      for (const running of runningSubagents.values()) {
+        running.agentStatus = statusMap.get(running.surface) ?? undefined;
+      }
+    }
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
@@ -1076,6 +1128,12 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+    applyHerdrIdentityIfEnabled(surface, {
+      displayName: params.name,
+      taskId: id,
+      task: params.task,
+      sessionFile: subagentSessionFile,
+    });
     return running;
   }
 
@@ -1214,6 +1272,12 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+  applyHerdrIdentityIfEnabled(surface, {
+    displayName: params.name,
+    taskId: id,
+    task: params.task,
+    sessionFile: subagentSessionFile,
+  });
   return running;
 }
 
@@ -1257,6 +1321,7 @@ async function watchSubagent(
       onTick() {
         observeRunningSubagent(running);
       },
+      nativeSlowPath: herdrNativeEnabled() ? (s) => nativeSlowPathFor(s) : undefined,
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1879,6 +1944,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        applyHerdrIdentityIfEnabled(surface, {
+          displayName: name,
+          taskId: id,
+          task: params.message ?? "resumed session",
+          sessionFile: params.sessionPath,
+        });
         startWidgetRefresh();
         startStatusRefresh(pi);
 

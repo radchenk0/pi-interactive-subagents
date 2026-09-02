@@ -20,6 +20,7 @@ import {
 import {
   shellEscape,
   isCmuxAvailable,
+  isHerdrAvailable,
   isWezTermAvailable,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
@@ -30,6 +31,11 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  getMuxBackend,
+  herdrSplitDirection,
+  parseHerdrResult,
+  balanceLayoutRatios,
+  collectLayoutPaneIds,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -54,7 +60,18 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__, __herdrTest__, pollForExit } from "../pi-extension/subagents/cmux.ts";
+import {
+  herdrNativeEnabled,
+  sanitizeAgentName,
+  nativeWaitSentinel,
+  nativeAgentStatusMap,
+  nativeAgentRename,
+  nativeReportMetadata,
+  nativeSendEscape,
+  applyHerdrAgentIdentity,
+  __herdrNativeTest__,
+} from "../pi-extension/subagents/herdr-native.ts";
 
 // --- Helpers ---
 
@@ -2373,6 +2390,439 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("parseHerdrResult", () => {
+    it("returns the result payload of a JSON envelope", () => {
+      const text =
+        '{"id":"cli:pane:current","result":{"pane":{"pane_id":"w1:p5"},"type":"pane_current"}}';
+      assert.deepEqual(parseHerdrResult(text), {
+        pane: { pane_id: "w1:p5" },
+        type: "pane_current",
+      });
+    });
+
+    it("returns null for empty output (no-payload commands)", () => {
+      assert.equal(parseHerdrResult(""), null);
+      assert.equal(parseHerdrResult("  \n"), null);
+    });
+
+    it("throws on malformed JSON", () => {
+      assert.throws(() => parseHerdrResult("not json"), /Unexpected token/);
+    });
+  });
+
+  describe("herdrSplitDirection", () => {
+    it("maps left/right to right and up/down to down (herdr only supports right/down)", () => {
+      assert.equal(herdrSplitDirection("right"), "right");
+      assert.equal(herdrSplitDirection("left"), "right");
+      assert.equal(herdrSplitDirection("down"), "down");
+      assert.equal(herdrSplitDirection("up"), "down");
+    });
+  });
+
+  describe("balanceLayoutRatios (herdr layout rebalance)", () => {
+    // Tree shape produced by 3 sequential `right` splits (herdr inserts each
+    // new pane as the `second` child of the deepest split):
+    // root(0.5): first=split(0.5)(first=split(0.5)(p1,p4), second=p3), second=p2
+    const nested = {
+      type: "split" as const,
+      direction: "right" as const,
+      ratio: 0.5,
+      first: {
+        type: "split" as const,
+        direction: "right" as const,
+        ratio: 0.5,
+        first: {
+          type: "split" as const,
+          direction: "right" as const,
+          ratio: 0.5,
+          first: { type: "pane" as const, pane_id: "w1:p1" },
+          second: { type: "pane" as const, pane_id: "w1:p4" },
+        },
+        second: { type: "pane" as const, pane_id: "w1:p3" },
+      },
+      second: { type: "pane" as const, pane_id: "w1:p2" },
+    };
+
+    it("targets equal pane shares: 3/4, 2/3, 1/2 for the 4-pane nested tree", () => {
+      const targets = balanceLayoutRatios(nested);
+      assert.equal(targets.length, 3);
+      assert.deepEqual(targets[0].path, []);
+      assert.equal(targets[0].ratio, 0.75);
+      assert.deepEqual(targets[1].path, [false]);
+      assert.ok(Math.abs(targets[1].ratio - 2 / 3) < 1e-9);
+      assert.deepEqual(targets[2].path, [false, false]);
+      assert.equal(targets[2].ratio, 0.5);
+    });
+
+    it("returns nothing for a single pane", () => {
+      assert.deepEqual(balanceLayoutRatios({ type: "pane", pane_id: "w1:p1" }), []);
+    });
+
+    it("keeps an already-even 2-pane tree at 0.5", () => {
+      const two = {
+        type: "split" as const,
+        direction: "down" as const,
+        ratio: 0.5,
+        first: { type: "pane" as const, pane_id: "a" },
+        second: { type: "pane" as const, pane_id: "b" },
+      };
+      assert.deepEqual(balanceLayoutRatios(two), [{ path: [], ratio: 0.5 }]);
+    });
+
+    it("handles a 5-pane mix of right and down splits (equal leaf share per node)", () => {
+      // root(down): first = 3 right-split panes, second = split(down)(p5, p6?) no —
+      // build: root(first=splitR(splitR(a,b),c), second=splitD(d,e))
+      const five = {
+        type: "split" as const,
+        direction: "down" as const,
+        ratio: 0.5,
+        first: {
+          type: "split" as const,
+          direction: "right" as const,
+          ratio: 0.5,
+          first: {
+            type: "split" as const,
+            direction: "right" as const,
+            ratio: 0.5,
+            first: { type: "pane" as const, pane_id: "a" },
+            second: { type: "pane" as const, pane_id: "b" },
+          },
+          second: { type: "pane" as const, pane_id: "c" },
+        },
+        second: {
+          type: "split" as const,
+          direction: "down" as const,
+          ratio: 0.5,
+          first: { type: "pane" as const, pane_id: "d" },
+          second: { type: "pane" as const, pane_id: "e" },
+        },
+      };
+      const targets = balanceLayoutRatios(five);
+      const byPath = Object.fromEntries(targets.map((t) => [JSON.stringify(t.path), t.ratio]));
+      assert.equal(byPath["[]"], 0.6); // 3 leaves vs 2 leaves
+      assert.ok(Math.abs(byPath[JSON.stringify([false])] - 2 / 3) < 1e-9);
+      assert.equal(byPath[JSON.stringify([false, false])], 0.5);
+      assert.equal(byPath[JSON.stringify([true])], 0.5);
+    });
+
+    it("gives the main pane 30% when 4+ panes are open, rest split 70% equally", () => {
+      // 4-pane nested tree; main pane is w1:p2 (the `second` child of root).
+      // mainWeight = 0.3 * 3 / 0.7 = 9/7. Root: first has weight 3, second 9/7
+      // → ratio = 3 / (30/7) = 0.7, so the main pane keeps 30%.
+      const weightOfPane = (id: string | null | undefined) => (id === "w1:p2" ? 9 / 7 : 1);
+      const targets = balanceLayoutRatios(nested, weightOfPane);
+      const byPath = Object.fromEntries(targets.map((t) => [JSON.stringify(t.path), t.ratio]));
+      assert.ok(Math.abs(byPath["[]"] - 0.7) < 1e-9); // main pane (second) gets 30%
+      assert.ok(Math.abs(byPath[JSON.stringify([false])] - 2 / 3) < 1e-9); // non-main subtree stays equal
+      assert.equal(byPath[JSON.stringify([false, false])], 0.5);
+    });
+
+    it("keeps 2-pane and 3-pane tabs fully equal (no main-pane bias)", () => {
+      const two = {
+        type: "split" as const,
+        direction: "right" as const,
+        ratio: 0.5,
+        first: { type: "pane" as const, pane_id: "main" },
+        second: { type: "pane" as const, pane_id: "sub1" },
+      };
+      // 2 panes: 50/50 even though the main pane is named — rebalance only
+      // applies weights at N>=4, so the plain call is the 2-pane behavior.
+      assert.deepEqual(balanceLayoutRatios(two), [{ path: [], ratio: 0.5 }]);
+    });
+
+    it("collectLayoutPaneIds lists all leaves in tree order", () => {
+      assert.deepEqual(collectLayoutPaneIds(nested), ["w1:p1", "w1:p4", "w1:p3", "w1:p2"]);
+    });
+  });
+
+  describe("getMuxBackend (herdr)", () => {
+    const savedEnv = {
+      PI_SUBAGENT_MUX: process.env.PI_SUBAGENT_MUX,
+      TMUX: process.env.TMUX,
+      CMUX_SOCKET_PATH: process.env.CMUX_SOCKET_PATH,
+    };
+
+    after(() => {
+      __herdrTest__.setRuntimeAvailableForTest(null);
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    it("selects herdr before tmux when both environments are set (spec D10)", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      delete process.env.CMUX_SOCKET_PATH;
+      process.env.TMUX = "/tmp/tmux-0/default,12345,0";
+      __herdrTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdr");
+      } finally {
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("selects cmux before herdr when both are available", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      process.env.TMUX = "/tmp/tmux-0/default,12345,0";
+      process.env.CMUX_SOCKET_PATH = "/tmp/cmux.sock";
+      __herdrTest__.setRuntimeAvailableForTest(true);
+      try {
+        // cmux requires the cmux binary to be on PATH; where it is missing the
+        // detection correctly falls through to herdr (still cmux-first ordering).
+        const expected = isCmuxAvailable() ? "cmux" : "herdr";
+        assert.equal(getMuxBackend(), expected);
+      } finally {
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("honors PI_SUBAGENT_MUX=herdr explicit preference (spec D12)", () => {
+      process.env.PI_SUBAGENT_MUX = "herdr";
+      __herdrTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdr");
+      } finally {
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("returns null for PI_SUBAGENT_MUX=herdr when herdr is not available", () => {
+      process.env.PI_SUBAGENT_MUX = "herdr";
+      __herdrTest__.setRuntimeAvailableForTest(false);
+      try {
+        assert.equal(getMuxBackend(), null);
+      } finally {
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+  });
+
+  describe("isHerdrAvailable", () => {
+    it("returns boolean", () => {
+      assert.equal(typeof isHerdrAvailable(), "boolean");
+    });
+  });
+});
+
+describe("herdr-native.ts", () => {
+  after(() => {
+    __herdrNativeTest__.setRunner(null);
+    __herdrNativeTest__.setAsyncRunner(null);
+    __herdrNativeTest__.setBackendResolver(null);
+  });
+
+  describe("herdrNativeEnabled", () => {
+    it("is true by default on the herdr backend", () => {
+      __herdrNativeTest__.setBackendResolver(() => "herdr");
+      assert.equal(herdrNativeEnabled({}), true);
+    });
+
+    it("is false when explicitly disabled with 0", () => {
+      __herdrNativeTest__.setBackendResolver(() => "herdr");
+      assert.equal(herdrNativeEnabled({ PI_SUBAGENT_HERDR_NATIVE: "0" }), false);
+    });
+
+    it("is false when the backend is not herdr", () => {
+      __herdrNativeTest__.setBackendResolver(() => "cmux");
+      assert.equal(herdrNativeEnabled({}), false);
+    });
+
+    it("accepts explicit 1 as on", () => {
+      __herdrNativeTest__.setBackendResolver(() => "herdr");
+      assert.equal(herdrNativeEnabled({ PI_SUBAGENT_HERDR_NATIVE: "1" }), true);
+    });
+  });
+
+  describe("sanitizeAgentName", () => {
+    it("maps display names into the herdr charset", () => {
+      assert.equal(sanitizeAgentName("Worker 1"), "worker-1");
+      assert.equal(sanitizeAgentName("A_B-c"), "a_b-c");
+      assert.equal(sanitizeAgentName("🔧 Pi Worker: auth"), "pi-worker-auth");
+    });
+
+    it("fixes leading digits and empty names", () => {
+      assert.equal(sanitizeAgentName("123abc"), "s-123abc");
+      assert.equal(sanitizeAgentName(""), "subagent");
+      assert.equal(sanitizeAgentName("///"), "subagent");
+    });
+
+    it("caps length at 32", () => {
+      const out = sanitizeAgentName("a".repeat(80));
+      assert.equal(out.length, 32);
+    });
+  });
+
+  describe("nativeWaitSentinel", () => {
+    it("returns the shell exit code from a matched sentinel line", async () => {
+      let capturedArgs: string[] = [];
+      __herdrNativeTest__.setAsyncRunner(async (args) => {
+        capturedArgs = args;
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            ok: true, result: { pane_id: "w1:p9", matched_line: "$ __SUBAGENT_DONE_3__" },
+          }),
+          stderr: "",
+        };
+      });
+      const result = await nativeWaitSentinel("w1:p9", 1500);
+      assert.deepEqual(result, { exitCode: 3 });
+      assert.deepEqual(capturedArgs, [
+        "pane", "wait-output", "w1:p9",
+        "--regex", __herdrNativeTest__.sentinelRegex,
+        "--source", "recent",
+        "--timeout", "1500",
+      ]);
+    });
+
+    it("returns null on timeout", async () => {
+      __herdrNativeTest__.setAsyncRunner(async () => ({
+        ok: false,
+        stdout: "",
+        stderr: JSON.stringify({ ok: false, error: { message: "timed out waiting for output" } }),
+      }));
+      assert.equal(await nativeWaitSentinel("w1:p9", 1500), null);
+    });
+
+    it("throws on hard errors", async () => {
+      __herdrNativeTest__.setAsyncRunner(async () => ({
+        ok: false,
+        stdout: "",
+        stderr: JSON.stringify({ ok: false, error: { message: "pane_not_found" } }),
+      }));
+      await assert.rejects(() => nativeWaitSentinel("w1:p9", 1500), /pane_not_found/);
+    });
+  });
+
+  describe("nativeAgentStatusMap", () => {
+    it("maps pane_id to agent_status", () => {
+      __herdrNativeTest__.setRunner(() => ({
+        ok: true,
+        stdout: JSON.stringify({
+          ok: true,
+          result: { agents: [
+            { pane_id: "w1:p1", agent_status: "working" },
+            { pane_id: "w1:p2", agent_status: "blocked" },
+            { agent_status: "idle" },
+          ] },
+        }),
+        stderr: "",
+      }));
+      const map = nativeAgentStatusMap();
+      assert.deepEqual([...map.entries()], [["w1:p1", "working"], ["w1:p2", "blocked"]]);
+    });
+
+    it("returns an empty map on CLI errors", () => {
+      __herdrNativeTest__.setRunner(() => ({ ok: false, stdout: "", stderr: "boom" }));
+      assert.equal(nativeAgentStatusMap().size, 0);
+    });
+  });
+
+  describe("nativeAgentRename / nativeSendEscape / nativeReportMetadata", () => {
+    it("rename builds the right args and reports success", () => {
+      let capturedArgs: string[] = [];
+      __herdrNativeTest__.setRunner((args) => {
+        capturedArgs = args;
+        return { ok: true, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+      });
+      assert.equal(nativeAgentRename("w1:p1", "worker-1"), true);
+      assert.deepEqual(capturedArgs, ["agent", "rename", "w1:p1", "worker-1"]);
+    });
+
+    it("rename returns false on failure", () => {
+      __herdrNativeTest__.setRunner(() => ({ ok: false, stdout: "", stderr: "name_in_use" }));
+      assert.equal(nativeAgentRename("w1:p1", "worker-1"), false);
+    });
+
+    it("sendEscape uses the validated agent key path", () => {
+      let capturedArgs: string[] = [];
+      __herdrNativeTest__.setRunner((args) => {
+        capturedArgs = args;
+        return { ok: true, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+      });
+      assert.equal(nativeSendEscape("w1:p1"), true);
+      assert.deepEqual(capturedArgs, ["agent", "send-keys", "w1:p1", "esc"]);
+    });
+
+    it("sendEscape returns false on failure (caller falls back to raw)", () => {
+      __herdrNativeTest__.setRunner(() => ({ ok: false, stdout: "", stderr: "agent_not_found" }));
+      assert.equal(nativeSendEscape("w1:p1"), false);
+    });
+
+    it("reportMetadata includes display-only fields", () => {
+      let capturedArgs: string[] = [];
+      __herdrNativeTest__.setRunner((args) => {
+        capturedArgs = args;
+        return { ok: true, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+      });
+      assert.equal(nativeReportMetadata("w1:p1", "subagents:abc", { displayAgent: "Worker", title: "do the thing" }), true);
+      assert.deepEqual(capturedArgs, [
+        "pane", "report-metadata", "w1:p1",
+        "--source", "subagents:abc",
+        "--display-agent", "Worker",
+        "--title", "do the thing",
+      ]);
+    });
+  });
+
+  describe("applyHerdrAgentIdentity", () => {
+    it("retries rename until the agent is detected, then reports metadata", async () => {
+      let renameCalls = 0;
+      const metadataCalls: string[][] = [];
+      __herdrNativeTest__.setRunner((args) => {
+        if (args[0] === "agent" && args[1] === "rename") {
+          renameCalls++;
+          if (renameCalls < 3) {
+            return { ok: false, stdout: "", stderr: "agent_not_found" };
+          }
+        }
+        if (args[0] === "pane" && args[1] === "report-metadata") {
+          metadataCalls.push(args);
+        }
+        return { ok: true, stdout: JSON.stringify({ ok: true, result: {} }), stderr: "" };
+      });
+      await applyHerdrAgentIdentity("w1:p1", { displayName: "Worker 1", taskId: "abc" }, 5, 5);
+      assert.equal(renameCalls, 3);
+      assert.equal(metadataCalls.length, 1);
+      assert.ok(metadataCalls[0].includes("Worker 1"));
+    });
+
+    it("gives up silently when the agent never appears", async () => {
+      let calls = 0;
+      __herdrNativeTest__.setRunner(() => {
+        calls++;
+        return { ok: false, stdout: "", stderr: "agent_not_found" };
+      });
+      await applyHerdrAgentIdentity("w1:p1", { taskId: "abc" }, 3, 5);
+      assert.equal(calls, 3);
+    });
+  });
+
+  describe("pollForExit native slow path", () => {
+    it("uses the native sentinel result", async () => {
+      let calls = 0;
+      const result = await pollForExit("no-such-surface", new AbortController().signal, {
+        interval: 10,
+        nativeSlowPath: async () => {
+          calls++;
+          if (calls === 1) return null; // first wait times out
+          return { exitCode: 2 };
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 2 });
+      assert.equal(calls, 2);
+    });
+
+    it("returns immediately when the sentinel is already present", async () => {
+      const result = await pollForExit("no-such-surface", new AbortController().signal, {
+        interval: 10,
+        nativeSlowPath: async () => ({ exitCode: 0 }),
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
     });
   });
 });

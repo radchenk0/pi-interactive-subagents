@@ -1,12 +1,13 @@
 import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import net from "node:net";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "herdr" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,13 +44,53 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (
+    pref === "cmux" ||
+    pref === "herdr" ||
+    pref === "tmux" ||
+    pref === "zellij" ||
+    pref === "wezterm"
+  )
+    return pref;
   return null;
 }
 
 function isCmuxRuntimeAvailable(): boolean {
   return !!process.env.CMUX_SOCKET_PATH && hasCommand("cmux");
 }
+
+let herdrRuntimeAvailable: boolean | null = null;
+
+/**
+ * herdr availability = the `herdr` CLI exists AND `herdr pane current` exits 0
+ * with a parseable JSON envelope (i.e. we are inside a live herdr session).
+ * Result is cached for the process lifetime; __herdrTest__ overrides it in tests.
+ */
+function isHerdrRuntimeAvailable(): boolean {
+  if (herdrRuntimeAvailable === null) {
+    if (!hasCommand("herdr")) {
+      herdrRuntimeAvailable = false;
+    } else {
+      try {
+        const out = execFileSync("herdr", ["pane", "current"], {
+          encoding: "utf8",
+          timeout: 5000,
+        }).trim();
+        herdrRuntimeAvailable = parseHerdrResult(out) !== null;
+      } catch {
+        herdrRuntimeAvailable = false;
+      }
+    }
+  }
+  return herdrRuntimeAvailable;
+}
+
+export const __herdrTest__ = {
+  /** Force (or reset with null) the cached herdr availability result. */
+  setRuntimeAvailableForTest(value: boolean | null): void {
+    herdrRuntimeAvailable = value;
+  },
+};
 
 function isTmuxRuntimeAvailable(): boolean {
   return !!process.env.TMUX && hasCommand("tmux");
@@ -67,6 +108,10 @@ export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function isTmuxAvailable(): boolean {
   return isTmuxRuntimeAvailable();
 }
@@ -82,11 +127,17 @@ export function isWezTermAvailable(): boolean {
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
 
+  // herdr must be detected BEFORE tmux: older herdr releases ran on top of
+  // tmux (TMUX env is set inside herdr), so a tmux-first check would pick the
+  // wrong backend. herdr 0.8.x is standalone, but the ordering stays for
+  // compatibility with those versions. (spec D10)
   if (isCmuxRuntimeAvailable()) return "cmux";
+  if (isHerdrRuntimeAvailable()) return "herdr";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
@@ -102,6 +153,9 @@ export function muxSetupHint(): string {
   if (pref === "cmux") {
     return "Start pi inside cmux (`cmux pi`).";
   }
+  if (pref === "herdr") {
+    return "Start pi inside herdr (`herdr`, then run `pi`).";
+  }
   if (pref === "tmux") {
     return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
   }
@@ -111,7 +165,7 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  return "Start pi inside cmux (`cmux pi`), herdr (`herdr`, then run `pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -742,14 +796,274 @@ function createCmuxSplitSurface(
 }
 
 /**
+ * Run `herdr <args>` and return the parsed `result` payload of the JSON
+ * envelope. herdr v0.8.0 wraps every CLI response in `{"id": ..., "result": {...}}`
+ * (parse, don't regex — see spec). Commands that print no payload
+ * (`pane run`, `pane send-keys`) resolve to null. Throws with the CLI's error
+ * message on failure (herdr reports errors as `{"error": {...}}` on stdout
+ * with a non-zero exit code).
+ */
+export function herdrCli(args: string[]): unknown {
+  const result = spawnSync("herdr", args, { encoding: "utf8" });
+  const stdout = (result.stdout ?? "").trim();
+  if (result.error) {
+    throw new Error(`herdr ${args.join(" ")} failed: ${(result.error as Error).message}`);
+  }
+  if (result.status !== 0) {
+    let detail = (result.stderr ?? "").trim();
+    try {
+      const err = (JSON.parse(stdout) as { error?: { message?: string } }).error;
+      if (err?.message) detail = err.message;
+    } catch {
+      detail = detail || stdout || `exit ${result.status}`;
+    }
+    throw new Error(`herdr ${args.join(" ")} failed: ${detail}`);
+  }
+  return parseHerdrResult(stdout);
+}
+
+/**
+ * Parse a herdr CLI JSON envelope (`{"id":..., "result": {...}}`) and return
+ * its `result` payload. Empty output (commands with no payload) returns null.
+ * Throws on malformed JSON. Exposed for unit testing.
+ */
+export function parseHerdrResult(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const parsed = JSON.parse(trimmed);
+  if (parsed && typeof parsed === "object" && "result" in parsed) {
+    return (parsed as { result: unknown }).result;
+  }
+  return parsed;
+}
+
+/**
+ * Run `herdr <args>` and return raw stdout (for commands like `pane read`
+ * that emit plain text rather than a JSON envelope).
+ */
+function herdrExec(args: string[]): string {
+  const result = spawnSync("herdr", args, { encoding: "utf8" });
+  if (result.error) {
+    throw new Error(`herdr ${args.join(" ")} failed: ${(result.error as Error).message}`);
+  }
+  if (result.status !== 0) {
+    let detail = (result.stderr ?? "").trim();
+    const stdout = (result.stdout ?? "").trim();
+    try {
+      const err = (JSON.parse(stdout) as { error?: { message?: string } }).error;
+      if (err?.message) detail = err.message;
+    } catch {
+      if (!detail) detail = stdout || `exit ${result.status}`;
+    }
+    throw new Error(`herdr ${args.join(" ")} failed: ${detail}`);
+  }
+  return result.stdout;
+}
+
+/**
+ * herdr 0.8.x layout API.
+ *
+ * The herdr CLI (0.8.0) exposes `pane layout` read-only, but the socket API
+ * (NDJSON on `~/.config/herdr/herdr.sock`) has `layout.export` and
+ * `layout.set_split_ratio`. herdr splits are a binary tree where every node
+ * has a `ratio` (share given to `first`); sequential right/down splits with
+ * 0.5 ratios accumulate into progressively squashed panes, so after each
+ * split we rebalance by setting each node's ratio to leaves(first)/leaves(node).
+ */
+
+type HerdrLayoutNode =
+  | { type: "pane"; pane_id?: string | null }
+  | {
+      type: "split";
+      direction: "right" | "down";
+      ratio: number;
+      first: HerdrLayoutNode;
+      second: HerdrLayoutNode;
+    };
+
+export interface BalancedSplitRatio {
+  /** Path from the root: `false` = first child, `true` = second child. */
+  path: boolean[];
+  /** Target ratio: share of the node's space given to its first child. */
+  ratio: number;
+}
+
+function layoutWeight(
+  node: HerdrLayoutNode,
+  weightOfPane?: (paneId: string | null | undefined) => number,
+): number {
+  if (node.type === "pane") return weightOfPane ? weightOfPane(node.pane_id) : 1;
+  return (
+    layoutWeight(node.first, weightOfPane) + layoutWeight(node.second, weightOfPane)
+  );
+}
+
+/**
+ * Collect the pane ids of all leaves in a herdr layout tree.
+ */
+export function collectLayoutPaneIds(root: HerdrLayoutNode): string[] {
+  if (root.type === "pane") {
+    return root.pane_id ? [root.pane_id] : [];
+  }
+  return [...collectLayoutPaneIds(root.first), ...collectLayoutPaneIds(root.second)];
+}
+
+/**
+ * Compute the target ratio for every split node in a herdr layout tree.
+ * Each split gets weight(first) / weight(node), so every pane's final share
+ * of the space telescopes to its own weight over the total weight — for
+ * equal weights that is equal pane sizes. `weightOfPane` may favor specific
+ * panes (e.g. the main pi pane); exposed for unit testing.
+ */
+export function balanceLayoutRatios(
+  root: HerdrLayoutNode,
+  weightOfPane?: (paneId: string | null | undefined) => number,
+): BalancedSplitRatio[] {
+  const out: BalancedSplitRatio[] = [];
+  const walk = (node: HerdrLayoutNode, path: boolean[]): void => {
+    if (node.type !== "split") return;
+    const first = layoutWeight(node.first, weightOfPane);
+    const second = layoutWeight(node.second, weightOfPane);
+    const total = first + second;
+    if (total > 0) {
+      out.push({ path, ratio: first / total });
+    }
+    walk(node.first, [...path, false]);
+    walk(node.second, [...path, true]);
+  };
+  walk(root, []);
+  return out;
+}
+
+function findLayoutRatioAt(root: HerdrLayoutNode, path: boolean[]): number | undefined {
+  let node: HerdrLayoutNode = root;
+  for (const step of path) {
+    if (node.type !== "split") return undefined;
+    node = step ? node.second : node.first;
+  }
+  return node.type === "split" ? node.ratio : undefined;
+}
+
+function herdrSocketPath(): string {
+  return process.env.HERDR_SOCKET ?? join(homedir(), ".config", "herdr", "herdr.sock");
+}
+
+/**
+ * Send one NDJSON request to the herdr server socket and resolve with its
+ * `result` payload. herdr 0.8.0 wire format: `{"id":...,"method":...,"params":...}`
+ * terminated by newline; the reply is a single JSON line.
+ */
+export function herdrSocketCall(method: string, params: Record<string, unknown>, timeoutMs = 2500): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const sockPath = herdrSocketPath();
+    if (!existsSync(sockPath)) {
+      reject(new Error(`herdr socket not found at ${sockPath}`));
+      return;
+    }
+    const sock = net.connect(sockPath);
+    let buffer = "";
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error(`herdr socket call ${method} timed out`));
+    }, timeoutMs);
+    const finish = (fn: () => void) => {
+      clearTimeout(timer);
+      sock.destroy();
+      fn();
+    };
+    sock.on("connect", () => {
+      const id = `pi-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+      sock.write(`${JSON.stringify({ id, method, params })}\n`);
+    });
+    sock.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      const line = buffer.slice(0, newline);
+      finish(() => {
+        try {
+          const message = JSON.parse(line) as { result?: unknown; error?: { message?: string } };
+          if (message.error) reject(new Error(message.error.message || `herdr ${method} failed`));
+          else resolve(message.result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    sock.on("error", (error) => finish(() => reject(error)));
+  });
+}
+
+/**
+ * Rebalance the tab containing `paneId` so panes get the desired shares:
+ * 2 panes → 50/50, 3 panes → equal thirds, 4+ panes → the main pane keeps
+ * 30% and the rest split the remaining 70% equally. Cosmetic: failures are
+ * logged nowhere and must never break the spawn path.
+ */
+export async function rebalanceHerdrPane(paneId: string, mainPaneId?: string): Promise<void> {
+  const exported = (await herdrSocketCall("layout.export", { pane_id: paneId })) as {
+    layout?: { tab_id?: string; root?: HerdrLayoutNode };
+  } | null;
+  const root = exported?.layout?.root;
+  const tabId = exported?.layout?.tab_id;
+  if (!root || root.type !== "split" || !tabId) return;
+  const paneIds = collectLayoutPaneIds(root);
+  let weightOfPane: ((paneId: string | null | undefined) => number) | undefined;
+  if (mainPaneId && paneIds.includes(mainPaneId) && paneIds.length >= 4) {
+    const mainShare = 0.3;
+    const mainWeight = (mainShare * (paneIds.length - 1)) / (1 - mainShare);
+    weightOfPane = (id) => (id === mainPaneId ? mainWeight : 1);
+  }
+  const targets = balanceLayoutRatios(root, weightOfPane);
+  for (const target of targets) {
+    const current = findLayoutRatioAt(root, target.path);
+    if (current !== undefined && Math.abs(current - target.ratio) < 0.02) continue;
+    try {
+      await herdrSocketCall("layout.set_split_ratio", {
+        tab_id: tabId,
+        path: target.path,
+        ratio: target.ratio,
+      });
+    } catch {
+      // Best effort — a failed ratio set is purely cosmetic.
+    }
+  }
+}
+
+/**
+ * herdr only supports right/down splits; map left/up onto them. The new pane
+ * ends up on the right/bottom rather than the requested side — accepted
+ * limitation (herdr has no left/up split).
+ */
+export function herdrSplitDirection(direction: "left" | "right" | "up" | "down"): "right" | "down" {
+  return direction === "down" || direction === "up" ? "down" : "right";
+}
+
+/**
+ * Resolve the id of the pane herdr is currently associated with (the pi pane).
+ */
+function herdrCurrentPane(): { paneId: string; workspaceId?: string } {
+  const result = herdrCli(["pane", "current"]) as
+    | { pane?: { pane_id?: unknown; workspace_id?: unknown } }
+    | undefined;
+  const paneId = result?.pane?.pane_id;
+  if (typeof paneId !== "string" || !paneId) {
+    throw new Error(`Unexpected herdr pane current output: ${JSON.stringify(result)}`);
+  }
+  const workspaceId = result?.pane?.workspace_id;
+  return { paneId, workspaceId: typeof workspaceId === "string" ? workspaceId : undefined };
+}
+
+/**
  * Create a new terminal surface for a subagent.
  *
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For tmux/wezterm: falls back to split behavior.
+ * For tmux/herdr/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `w1:p8` in herdr,
+ * `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
@@ -774,6 +1088,10 @@ export function createSurface(name: string): string {
 
   if (backend === "zellij") {
     return createZellijSurface(name);
+  }
+
+  if (backend === "herdr") {
+    return createSurfaceSplit(name, "right", herdrCurrentPane().paneId);
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
@@ -810,7 +1128,8 @@ function createSurfaceInPane(name: string, pane: string): string {
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `w1:p8` in herdr,
+ * `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurfaceSplit(
   name: string,
@@ -821,6 +1140,32 @@ export function createSurfaceSplit(
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
+  }
+
+  if (backend === "herdr") {
+    // A2: herdr requires the source pane as `--pane <id>`.
+    const source = fromSurface ?? herdrCurrentPane().paneId;
+    const result = herdrCli([
+      "pane",
+      "split",
+      "--pane",
+      source,
+      "--direction",
+      herdrSplitDirection(direction),
+      "--no-focus",
+      "--cwd",
+      process.cwd(),
+    ]) as { pane?: { pane_id?: unknown } } | undefined;
+    const paneId = result?.pane?.pane_id;
+    if (typeof paneId !== "string" || !paneId) {
+      throw new Error(`Unexpected herdr pane split output: ${JSON.stringify(result)}`);
+    }
+    // Cosmetic: herdr 0.5-ratio split accumulation squashes earlier panes once
+    // a few agents are up. Rebalance the tab in the background — the main pi
+    // pane keeps 30% (or its equal share with 2-3 panes) and the subagent
+    // panes split the rest. Never blocks or fails the spawn.
+    void rebalanceHerdrPane(paneId, source).catch(() => {});
+    return paneId;
   }
 
   if (backend === "tmux") {
@@ -910,6 +1255,11 @@ export function createSurfaceSplit(
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    herdrCli(["pane", "rename", herdrCurrentPane().paneId, title]);
+    return;
+  }
+
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
@@ -957,6 +1307,15 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    const { workspaceId } = herdrCurrentPane();
+    if (!workspaceId) {
+      throw new Error("herdr pane current: missing workspace_id");
+    }
+    herdrCli(["workspace", "rename", workspaceId, title]);
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -1011,6 +1370,12 @@ export function renameWorkspace(title: string): void {
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // `pane run` types the command into the pane's shell and presses Enter.
+    herdrCli(["pane", "run", surface, command]);
+    return;
+  }
+
   if (backend === "cmux") {
     execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
       encoding: "utf8",
@@ -1042,6 +1407,11 @@ export function sendCommand(surface: string, command: string): void {
  */
 export function sendEscape(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    herdrCli(["pane", "send-keys", surface, "esc"]);
+    return;
+  }
 
   if (backend === "cmux") {
     execFileSync("cmux", ["send", "--surface", surface, "\u001b"], { encoding: "utf8" });
@@ -1107,6 +1477,23 @@ export function sendLongCommand(
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // `pane read --source recent-unwrapped --format text` emits clean plain text
+    // with long lines unwrapped (verified live, spec A1) — long strings aren't
+    // split across terminal wrap lines, so sentinel/marker regexes match.
+    return herdrExec([
+      "pane",
+      "read",
+      surface,
+      "--lines",
+      String(Math.max(1, lines)),
+      "--source",
+      "recent-unwrapped",
+      "--format",
+      "text",
+    ]);
+  }
+
   if (backend === "cmux") {
     return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
       encoding: "utf8",
@@ -1150,6 +1537,23 @@ export function readScreen(surface: string, lines = 50): string {
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
 
+  if (backend === "herdr") {
+    // `pane read --source recent-unwrapped --format text` emits clean plain text
+    // with long lines unwrapped (verified live, spec A1).
+    const { stdout } = await execFileAsync("herdr", [
+      "pane",
+      "read",
+      surface,
+      "--lines",
+      String(Math.max(1, lines)),
+      "--source",
+      "recent-unwrapped",
+      "--format",
+      "text",
+    ]);
+    return stdout;
+  }
+
   if (backend === "cmux") {
     const { stdout } = await execFileAsync(
       "cmux",
@@ -1192,6 +1596,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
+
+  if (backend === "herdr") {
+    herdrCli(["pane", "close", surface]);
+    return;
+  }
 
   if (backend === "cmux") {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {
@@ -1264,9 +1673,17 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /**
+     * Optional native slow path (herdr `pane wait-output`): server-side
+     * sentinel search+poll. When provided and it returns (even null = timeout),
+     * the screen-scraping fallback is skipped for that iteration. When it
+     * throws, the screen fallback is used (raw path) for the rest of the run.
+     */
+    nativeSlowPath?: (surface: string) => Promise<{ exitCode: number } | null>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let nativeDisabled = false;
 
   for (;;) {
     if (signal.aborted) {
@@ -1294,12 +1711,27 @@ export async function pollForExit(
       } catch {}
     }
 
-    // Slow path: read terminal screen for sentinel (crash detection)
+    // Slow path: shell sentinel. Native wait-output when available (herdr),
+    // otherwise read the terminal screen.
     try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      let sentinel: { exitCode: number } | null = null;
+      let usedNative = false;
+      if (!nativeDisabled && options.nativeSlowPath) {
+        try {
+          sentinel = await options.nativeSlowPath(surface);
+          usedNative = true;
+        } catch {
+          nativeDisabled = true; // hard error — fall back to screen reads
+        }
+      }
+      if (!usedNative) {
+        const screen = await readScreenAsync(surface, 5);
+        const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+        if (match) {
+          return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+        }
+      } else if (sentinel) {
+        return { reason: "sentinel", exitCode: sentinel.exitCode };
       }
     } catch {
       // Surface may have been destroyed — check if .exit file appeared in the meantime

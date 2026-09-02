@@ -1,6 +1,6 @@
 ---
 name: worker
-description: ABSTRACT base worker — shared role definition for worker implementations (pi-worker, worker-claude). Not directly spawnable; spawn a concrete implementation.
+description: ABSTRACT base worker — shared role definition for worker implementations (pi-worker, claude-worker). Not directly spawnable; spawn a concrete implementation.
 disable-model-invocation: true
 ---
 

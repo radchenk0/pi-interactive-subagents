@@ -108,12 +108,12 @@ For richer herdr integration (authoritative lifecycle states + native session re
 | ---------------- | -------------- | --------------------------------------------------------------------------------------------- |
 | **planner**      | pi (interactive) | In-pane planner — interviews the user (goal → decisions) then writes a `spec.md` + sliced `plan.md`; never implements |
 | **pi-worker**    | pi subagent    | Implements a well-scoped task — writes code, runs tests, verifies with evidence; extends the abstract `worker` base |
-| **worker-claude**| Claude Code    | Same worker role/standards as `pi-worker`, executed by the `claude` CLI; extends the abstract `worker` base |
+| **claude-worker**| Claude Code    | Same worker role/standards as `pi-worker`, executed by the `claude` CLI; extends the abstract `worker` base |
 | **reviewer**     | pi subagent    | Reviews code for bugs, security issues, correctness                                          |
 | **researcher**   | pi subagent    | Web research — searches and synthesizes findings into a sourced brief                          |
 | **tester**       | pi subagent    | QA — backend tests (unit/integration/API) + frontend via Playwright MCP; P0-P3 reports         |
 
-`worker` itself is an **abstract base** (`disable-model-invocation: true`) shared by `pi-worker` and `worker-claude` via the `extends:` frontmatter — spawn a concrete implementation, not the base.
+`worker` itself is an **abstract base** (`disable-model-invocation: true`) shared by `pi-worker` and `claude-worker` via the `extends:` frontmatter — spawn a concrete implementation, not the base.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
@@ -324,7 +324,8 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high` (pi CLI)                                                                                                                                                                                                                          |
+| `effort`      | string  | Effort level for the `claude` CLI: `low`, `medium`, `high`, `xhigh`, `max` (passed as `--effort`; ignored for the pi CLI)                                                                                                                                          |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |

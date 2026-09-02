@@ -166,6 +166,7 @@ interface AgentDefaults {
   tools?: string;
   skills?: string;
   thinking?: string;
+  effort?: string;
   denyTools?: string;
   extends?: string;
   spawning?: boolean;
@@ -346,6 +347,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: envValue(getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills")),
     thinking: envValue(getFrontmatterValue(frontmatter, "thinking")),
+    effort: envValue(getFrontmatterValue(frontmatter, "effort")),
     denyTools: envValue(getFrontmatterValue(frontmatter, "deny-tools")),
     extends: getFrontmatterValue(frontmatter, "extends"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
@@ -1188,6 +1190,10 @@ async function launchSubagent(
 
     if (effectiveModel) {
       cmdParts.push("--model", shellEscape(effectiveModel));
+    }
+
+    if (agentDefs.effort) {
+      cmdParts.push("--effort", shellEscape(agentDefs.effort));
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;

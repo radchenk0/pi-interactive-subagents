@@ -1991,7 +1991,111 @@ describe("subagent interruption", () => {
   });
 });
 
+describe("subagent kill", () => {
+  function makeRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "a1",
+      name: "Worker",
+      task: "",
+      surface: "pane-1",
+      startTime: 0,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
 
+  it("registers subagent_kill in the main session extension", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_kill"), true);
+  });
+
+  it("aborts the watcher, kills the surface, and removes the entry", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    let aborted = false;
+    const killedSurfaces: string[] = [];
+    const running = makeRunning({
+      abortController: {
+        abort() {
+          aborted = true;
+        },
+      },
+    });
+
+    try {
+      runningMap.set("a1", running);
+
+      const result = testApi.handleSubagentKill({ id: "a1" }, (surface: string) => {
+        killedSurfaces.push(surface);
+      });
+
+      assert.equal(aborted, true);
+      assert.equal(running.killRequested, true);
+      assert.deepEqual(killedSurfaces, ["pane-1"]);
+      assert.equal(runningMap.has("a1"), false);
+      assert.match(result.content[0].text, /Sub-agent "Worker" killed/);
+      assert.match(result.content[0].text, /worker\.jsonl/);
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "killed",
+        sessionFile: "worker.jsonl",
+      });
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports an unknown id without killing anything", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    const killedSurfaces: string[] = [];
+
+    try {
+      runningMap.set("a1", makeRunning());
+
+      const result = testApi.handleSubagentKill({ id: "nope" }, (surface: string) => {
+        killedSurfaces.push(surface);
+      });
+
+      assert.match(result.content[0].text, /No running subagent with id/);
+      assert.deepEqual(killedSurfaces, []);
+      assert.equal(runningMap.has("a1"), true);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("renders a crash presentation when crashMessage is set", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 1,
+        elapsed: 130,
+        summary:
+          "⚠ Subagent pane was destroyed externally — the pane no longer exists.\n\nLast output before crash",
+        sessionFile: "/tmp/subagent.jsonl",
+        crashMessage: "Subagent pane was destroyed externally — the pane no longer exists.",
+      },
+      "Worker",
+    );
+
+    assert.match(presentation, /Sub-agent "Worker" crashed after/);
+    assert.match(presentation, /destroyed externally/);
+    assert.match(presentation, /Last output before crash/);
+    assert.doesNotMatch(presentation, /auto-retry exhausted/);
+    assert.match(presentation, /Resume: pi --session/);
+  });
+});
 
 describe("subagent status renderer", () => {
   function createTheme() {

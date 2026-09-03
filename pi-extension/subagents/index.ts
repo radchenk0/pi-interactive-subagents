@@ -22,6 +22,7 @@ import {
   pollForExit,
   closeSurface,
   getMuxBackend,
+  herdrCli,
   sendEscape,
   shellEscape,
   renameCurrentTab,
@@ -660,6 +661,8 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Set when subagent_kill was called for this entry. */
+  killRequested?: boolean;
   statusState: SubagentStatusState;
   /** herdr-reported agent state (working/idle/blocked/...) — display only. */
   agentStatus?: string;
@@ -1002,6 +1005,83 @@ function handleSubagentInterrupt(
   };
 }
 
+/**
+ * Kill a subagent's pane and its processes (best effort), then close the
+ * pane. On herdr the shell and foreground process group are SIGKILLed first
+ * so the child pi process cannot outlive the pane. Never throws.
+ */
+function killSubagentSurface(surface: string): void {
+  if (getMuxBackend() === "herdr") {
+    try {
+      const info = herdrCli(["pane", "process-info", "--pane", surface]) as any;
+      const proc = info?.process_info ?? info;
+      const shellPid = Number.isInteger(proc?.shell_pid) ? (proc.shell_pid as number) : null;
+      const fgPgid = Number.isInteger(proc?.foreground_process_group_id)
+        ? (proc.foreground_process_group_id as number)
+        : null;
+      if (shellPid != null) {
+        try { process.kill(shellPid, "SIGKILL"); } catch {}
+      }
+      if (fgPgid != null) {
+        try { process.kill(-fgPgid, "SIGKILL"); } catch {}
+      }
+    } catch {
+      // Pane or process info unavailable — closing the pane below still cleans up.
+    }
+  }
+  closeSurface(surface);
+}
+
+/**
+ * Kill a running subagent: stop its watcher (so it emits a final
+ * "killed" subagent_result instead of polling a dead pane), terminate the
+ * child processes, close the pane, and remove the running entry. The
+ * session file is preserved for subagent_resume.
+ */
+function handleSubagentKill(
+  params: { id?: string; name?: string },
+  killSurfaceFn: (surface: string) => void = killSubagentSurface,
+) {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+
+  // Mark + abort so the watcher's catch path emits "killed" (not
+  // "cancelled") as the final subagent_result.
+  running.killRequested = true;
+  running.abortController?.abort();
+
+  try {
+    killSurfaceFn(running.surface);
+  } catch {
+    // Pane may already be gone — the kill still succeeded.
+  }
+
+  runningSubagents.delete(running.id);
+  updateWidget();
+
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Sub-agent "${running.name}" killed. Pane closed, entry removed. ` +
+        `The session file is preserved for resume: ${running.sessionFile}`,
+    }],
+    details: {
+      id: running.id,
+      name: running.name,
+      status: "killed",
+      sessionFile: running.sessionFile,
+    },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1089,6 +1169,8 @@ export const __test__ = {
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  handleSubagentKill,
+  killSubagentSurface,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1553,13 +1635,14 @@ async function watchSubagent(
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
+      const killed = running.killRequested === true;
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: killed ? "Subagent killed by the caller." : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: killed ? "killed" : "cancelled",
         sessionFile,
       };
     }
@@ -1857,6 +1940,60 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
               theme.fg("dim", " — interrupt requested"),
+            0,
+            0,
+          );
+        }
+
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_kill tool ──
+  if (shouldRegister("subagent_kill"))
+    pi.registerTool({
+      name: "subagent_kill",
+      label: "Kill Subagent",
+      description:
+        "Kill a running subagent: terminate its child process, close its pane, remove it from the running list, " +
+        "and emit a final subagent_result so the count is cleared. " +
+        "Use to drop a stalled or interrupted subagent that you no longer need. " +
+        "The session file is preserved — resume it later with subagent_resume.",
+      promptSnippet:
+        "Kill a running subagent: terminate its child process, close its pane, remove it from the running list, " +
+        "and emit a final subagent_result so the count is cleared. " +
+        "Use to drop a stalled or interrupted subagent that you no longer need. " +
+        "The session file is preserved — resume it later with subagent_resume.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentKill(params);
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — kill"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "killed") {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", " — killed, session preserved for resume"),
             0,
             0,
           );

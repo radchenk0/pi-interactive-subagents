@@ -8,6 +8,14 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  readQuestion,
+  waitForReply,
+  writeParentReply,
+  writeQuestion,
+  type QuestionOption,
+} from "./question-channel.ts";
+import { randomUUID } from "node:crypto";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -318,6 +326,124 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
         details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "ask_parent",
+    label: "Ask Parent",
+    description:
+      "Ask a question to the parent agent that spawned you. Your turn is BLOCKED until the parent " +
+      "answers (up to 10 minutes). Use for ambiguous requirements, significant decisions with " +
+      "irreversible consequences, or blockers you cannot resolve yourself — not for routine choices. " +
+      "Offer options with your recommendation first when useful. On timeout, proceed carefully and " +
+      "record your assumption in the final report.",
+    parameters: Type.Object({
+      question: Type.String({ description: "The single question to ask the parent agent." }),
+      details: Type.Optional(
+        Type.String({ description: "Optional extra context shown with the question." }),
+      ),
+      options: Type.Optional(
+        Type.Array(
+          Type.Object({
+            label: Type.String({ description: "Display label for the option." }),
+            value: Type.Optional(Type.String({ description: "Optional machine-readable value." })),
+            description: Type.Optional(Type.String({ description: "Optional detail below the option." })),
+          }),
+          { description: "Optional options to offer the parent. Recommended option first, labeled '(Recommended)'." },
+        ),
+      ),
+      multiSelect: Type.Optional(
+        Type.Boolean({ description: "Set true when several options may be correct at once." }),
+      ),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) {
+        throw new Error(
+          "ask_parent is only available in subagent contexts. " +
+            "PI_SUBAGENT_SESSION environment variable is not set.",
+        );
+      }
+
+      // No activity recorder call here: caller_ping() would mark the activity
+      // file phase "done", and the parent's activity fast-path would stop
+      // polling while this tool is still blocked waiting for the answer.
+
+      const qid = randomUUID();
+      writeQuestion(sessionFile, {
+        qid,
+        from: "worker",
+        question: params.question,
+        ...(params.details ? { details: params.details } : {}),
+        ...(params.options?.length ? { options: params.options as QuestionOption[] } : {}),
+        ...(typeof params.multiSelect === "boolean" ? { multiSelect: params.multiSelect } : {}),
+        ts: Date.now(),
+      });
+
+      const reply = await waitForReply(sessionFile, "answer", qid, { signal });
+      if (reply.ok) {
+        return {
+          content: [{ type: "text", text: `Parent answered: ${reply.answer}` }],
+          details: { qid, answer: reply.answer },
+        };
+      }
+      const reason =
+        reply.reason === "aborted"
+          ? "you were interrupted"
+          : "the parent did not answer in time";
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `No answer from the parent (${reason}). ` +
+              `Proceed carefully with your best judgment and record the assumption you made in your final report.`,
+          },
+        ],
+        details: { qid, error: reply.reason },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "reply_to_parent",
+    label: "Reply to Parent",
+    description:
+      "Answer a question the parent agent asked you (delivered as an injected " +
+      "'❓ Question from parent' message). Pass the answer text; the parent's ask_subagent " +
+      "call returns with it.",
+    parameters: Type.Object({
+      answer: Type.String({ description: "Your answer to the parent's question." }),
+      qid: Type.Optional(
+        Type.String({ description: "Question id if known (otherwise the pending question is used)." }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) {
+        throw new Error(
+          "reply_to_parent is only available in subagent contexts. " +
+            "PI_SUBAGENT_SESSION environment variable is not set.",
+        );
+      }
+
+      const pending = params.qid ? null : readQuestion(sessionFile);
+      const qid = params.qid ?? pending?.qid;
+      if (!qid) {
+        return {
+          content: [
+            { type: "text", text: "No pending parent question found. Nothing to reply to." },
+          ],
+          details: { error: "no pending question" },
+        };
+      }
+
+      writeParentReply(sessionFile, { qid, answer: params.answer, ts: Date.now() });
+      return {
+        content: [{ type: "text", text: "Reply delivered to the parent." }],
+        details: { qid },
       };
     },
   });

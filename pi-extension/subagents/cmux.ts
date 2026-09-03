@@ -4,6 +4,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } 
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import net from "node:net";
+import type { QuestionOption, QuestionPayload } from "./question-channel.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1675,11 +1676,13 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error" | "crashed";
+  reason: "done" | "ping" | "sentinel" | "error" | "crashed" | "question";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
+  /** Question data if reason is "question" (exit-based escalation, e.g. claude workers) */
+  question?: { qid: string; question: string; options?: QuestionOption[]; multiSelect?: boolean };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
@@ -1696,6 +1699,22 @@ function interpretExitSidecar(data: any): PollResult {
       exitCode: 0,
       ping: { name: data.name, message: data.message },
     };
+  }
+  if (data?.type === "question") {
+    if (typeof data.question === "string" && data.question.trim() !== "") {
+      return {
+        reason: "question",
+        exitCode: 0,
+        question: {
+          qid: typeof data.qid === "string" ? data.qid : "",
+          question: data.question,
+          ...(Array.isArray(data.options) && data.options.length > 0 ? { options: data.options } : {}),
+          ...(typeof data.multiSelect === "boolean" ? { multiSelect: data.multiSelect } : {}),
+        },
+      };
+    }
+    // Malformed question payload — fall through to done so the watcher still
+    // reports the exit instead of hanging.
   }
   if (data?.type === "error") {
     const errorMessage =
@@ -1743,6 +1762,12 @@ export async function pollForExit(
      * isSurfaceAlive().
      */
     isAlive?: (surface: string) => boolean | null;
+    /**
+     * Live question callback: invoked each tick when the child has written a
+     * `.question` sidecar (from the worker). The parent delivers it as a
+     * steer; dedup by qid is the caller's responsibility.
+     */
+    onQuestion?: (q: QuestionPayload) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -1763,6 +1788,20 @@ export async function pollForExit(
           return interpretExitSidecar(data);
         }
       } catch {}
+
+      // Live question channel: notify the parent about a pending worker question.
+      // The file stays in place — the answer round-trip is handled separately.
+      if (options.onQuestion) {
+        try {
+          const qf = `${options.sessionFile}.question`;
+          if (existsSync(qf)) {
+            const q = JSON.parse(readFileSync(qf, "utf8"));
+            if (q && q.from === "worker" && typeof q.question === "string" && q.question.trim() !== "") {
+              options.onQuestion(q);
+            }
+          }
+        } catch {}
+      }
     }
 
     // Fast path: child activity file reached the terminal "done" phase.

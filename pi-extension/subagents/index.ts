@@ -19,6 +19,7 @@ import {
   muxSetupHint,
   createSurface,
   sendLongCommand,
+  sendCommand,
   pollForExit,
   closeSurface,
   getMuxBackend,
@@ -61,6 +62,19 @@ import {
   nativeSendEscape,
   nativeWaitSentinel,
 } from "./herdr-native.ts";
+import {
+  clearQuestionSidecars,
+  formatQuestionForDisplay,
+  readQuestion,
+  waitForReply,
+  writeAnswer,
+  writeParentReply,
+  writeQuestion,
+  questionTimeoutMs,
+  type QuestionOption,
+  type QuestionPayload,
+} from "./question-channel.ts";
+import { randomUUID } from "node:crypto";
 
 /**
  * One-line warning when the native herdr path degrades to the raw path.
@@ -637,6 +651,8 @@ interface SubagentResult {
   /** Crash cause when the subagent's pane died externally (not a provider error). */
   crashMessage?: string;
   ping?: { name: string; message: string };
+  /** Question the subagent exited with (exit-based escalation, e.g. claude workers). */
+  question?: { qid: string; question: string; options?: QuestionOption[]; multiSelect?: boolean };
 }
 
 /**
@@ -663,6 +679,8 @@ interface RunningSubagent {
   sentinelFile?: string;
   /** Set when subagent_kill was called for this entry. */
   killRequested?: boolean;
+  /** qids of live worker questions already delivered as steer messages. */
+  notifiedQids?: Set<string>;
   statusState: SubagentStatusState;
   /** herdr-reported agent state (working/idle/blocked/...) — display only. */
   agentStatus?: string;
@@ -682,6 +700,9 @@ const runningSubagents = new Map<string, RunningSubagent>();
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
+
+/** Latest ExtensionAPI, used for out-of-tool message delivery (live worker questions). */
+let latestPi: ExtensionAPI | null = null;
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -821,7 +842,12 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = [
+  "caller_ping",
+  "subagent_done",
+  "ask_parent",
+  "reply_to_parent",
+] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -1275,6 +1301,7 @@ async function launchSubagent(
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+    cmdParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
@@ -1291,8 +1318,22 @@ async function launchSubagent(
     }
 
     const sp = params.systemPrompt ?? agentDefs.body;
+    // Exit-based question escalation: claude workers cannot make live blocking
+    // tool calls, so they escalate via the pi-escalate helper which writes the
+    // .exit question sidecar; the parent detects it and resumes this session.
+    const escalatePath = join(SUBAGENTS_DIR, "helper", "pi-escalate");
+    const escalationInstructions =
+      `\n\n## Communication with the parent (claude workers)` +
+      `\nYou cannot ask the parent live. If you are blocked and need a decision from the parent agent ` +
+      `(ambiguous requirement, a significant irreversible choice, or a blocker you cannot resolve ` +
+      `yourself), run this exact command in bash and then STOP your turn immediately:` +
+      `\n\n  ${escalatePath} "<your single question>"` +
+      `\n\nThe parent will be notified with your question and will resume this session with an answer. ` +
+      `Do not use it for routine decisions you can make yourself.`;
     if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+      cmdParts.push("--append-system-prompt", shellEscape(sp + escalationInstructions));
+    } else {
+      cmdParts.push("--append-system-prompt", shellEscape(escalationInstructions));
     }
 
     if (params.resumeSessionId) {
@@ -1521,6 +1562,37 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/**
+ * Deliver a live worker question to the parent session as a steer, once per qid.
+ * The child stays alive and blocked in its ask_parent tool until answered.
+ */
+function handleLiveWorkerQuestion(running: RunningSubagent, q: QuestionPayload): void {
+  if (running.notifiedQids?.has(q.qid)) return;
+  running.notifiedQids ??= new Set();
+  running.notifiedQids.add(q.qid);
+
+  latestPi?.sendMessage(
+    {
+      customType: "subagent_question",
+      content:
+        `Sub-agent "${running.name}" is asking (its turn is blocked, waiting for your answer):\n\n` +
+        `${formatQuestionForDisplay(q)}\n\n` +
+        `Answer with answer_subagent {id: "${running.id}", answer: "..."}. ` +
+        `If a human decision is required, first ask the user with ask_user_question and answer with their choice. ` +
+        `Do not guess the worker's question yourself.`,
+      display: true,
+      details: {
+        name: running.name,
+        qid: q.qid,
+        question: q.question,
+        ...(q.options?.length ? { options: q.options } : {}),
+        sessionFile: running.sessionFile,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1535,6 +1607,9 @@ async function watchSubagent(
       activityFile: running.activityFile,
       onTick() {
         observeRunningSubagent(running);
+      },
+      onQuestion(q) {
+        handleLiveWorkerQuestion(running, q);
       },
       nativeSlowPath: herdrNativeEnabled() ? (s) => nativeSlowPathFor(s) : undefined,
     });
@@ -1579,7 +1654,7 @@ async function watchSubagent(
       }
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}), ...(result.question ? { question: result.question } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1625,6 +1700,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ping: result.ping,
+      ...(result.question ? { question: result.question } : {}),
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(crashMessage ? { crashMessage } : {}),
     };
@@ -1658,6 +1734,8 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  latestPi = pi;
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1762,6 +1840,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+
+            if (result.question) {
+              // Exit-based escalation (e.g. claude worker): the session ended
+              // with a structured question — resume it with the answer.
+              const q = result.question;
+              pi.sendMessage(
+                {
+                  customType: "subagent_question",
+                  content:
+                    `Sub-agent "${result.name}" exited with a question and needs your answer (${formatElapsed(result.elapsed)}):\n\n` +
+                    `${formatQuestionForDisplay({ qid: q.qid, from: "worker", question: q.question, options: q.options, multiSelect: q.multiSelect, ts: 0 })}\n\n` +
+                    `If a human decision is required, first ask the user with ask_user_question. ` +
+                    `Then resume the sub-agent with the answer: subagent_resume {sessionPath: "${result.sessionFile}", message: "Answer to your question: <answer>"}.\n\n` +
+                    `Session: ${result.sessionFile}`,
+                  display: true,
+                  details: {
+                    name: result.name,
+                    qid: q.qid,
+                    question: q.question,
+                    ...(q.options?.length ? { options: q.options } : {}),
+                    sessionFile: result.sessionFile,
+                    resumeMessage: `Answer to your question: <answer>`,
+                  },
+                },
+                { triggerTurn: true, deliverAs: "steer" },
+              );
+              return;
+            }
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -2004,6 +2110,231 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── answer_subagent tool (deliver answer to a blocked worker) ──
+  if (shouldRegister("answer_subagent"))
+    pi.registerTool({
+      name: "answer_subagent",
+      label: "Answer Subagent",
+      description:
+        "Deliver an answer to a running sub-agent that is blocked in its ask_parent call. " +
+        "The sub-agent's turn continues immediately with your answer. " +
+        "Use when you received a subagent_question steer from a worker.",
+      promptSnippet:
+        "Deliver an answer to a running sub-agent that is blocked in its ask_parent call. " +
+        "The sub-agent's turn continues immediately with your answer.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        answer: Type.String({
+          description: "The answer text to deliver to the waiting sub-agent.",
+        }),
+      }),
+
+      async execute(_toolCallId, params) {
+        const resolved = resolveInterruptTarget(params);
+        if ("error" in resolved) {
+          return {
+            content: [{ type: "text" as const, text: resolved.error }],
+            details: { error: resolved.error },
+          };
+        }
+
+        const running = resolved.running;
+        const q = readQuestion(running.sessionFile);
+        if (!q || q.from !== "worker") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Sub-agent "${running.name}" has no pending question (it may have timed out and moved on).`,
+              },
+            ],
+            details: { id: running.id, name: running.name, error: "no pending question" },
+          };
+        }
+
+        writeAnswer(running.sessionFile, { qid: q.qid, answer: params.answer, ts: Date.now() });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Answer delivered to sub-agent "${running.name}". Its turn continues with your answer.`,
+            },
+          ],
+          details: { id: running.id, name: running.name, qid: q.qid },
+        };
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — answer"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.error) {
+          const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+          return new Text(theme.fg("dim", text), 0, 0);
+        }
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(details?.name ?? details?.id ?? "subagent")) +
+            theme.fg("dim", " — answer delivered"),
+          0,
+          0,
+        );
+      },
+    });
+
+  // ── ask_subagent tool (parent asks a live worker a question) ──
+  if (shouldRegister("ask_subagent"))
+    pi.registerTool({
+      name: "ask_subagent",
+      label: "Ask Subagent",
+      description:
+        "Ask a question to a RUNNING pi sub-agent. The question is injected into the sub-agent's " +
+        "terminal; it answers with its reply_to_parent tool and this tool returns the answer. " +
+        "Your turn is blocked until the sub-agent answers or the timeout fires. " +
+        "Not available for claude-CLI workers (use subagent_resume for those).",
+      promptSnippet:
+        "Ask a question to a RUNNING pi sub-agent; blocks until it answers (or times out).",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        question: Type.String({ description: "The question to ask the sub-agent." }),
+        details: Type.Optional(
+          Type.String({ description: "Optional extra context shown with the question." }),
+        ),
+        options: Type.Optional(
+          Type.Array(
+            Type.Object({
+              label: Type.String({ description: "Display label for the option." }),
+              value: Type.Optional(Type.String({ description: "Optional machine-readable value." })),
+              description: Type.Optional(Type.String({ description: "Optional detail below the option." })),
+            }),
+            { description: "Optional multiple-choice options to offer the sub-agent." },
+          ),
+        ),
+        multiSelect: Type.Optional(
+          Type.Boolean({ description: "Set true when several options may be chosen." }),
+        ),
+      }),
+
+      async execute(_toolCallId, params, signal) {
+        const resolved = resolveInterruptTarget(params);
+        if ("error" in resolved) {
+          return {
+            content: [{ type: "text" as const, text: resolved.error }],
+            details: { error: resolved.error },
+          };
+        }
+
+        const running = resolved.running;
+        if (running.cli === "claude") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Sub-agent "${running.name}" is a claude-CLI session and cannot be asked live. ` +
+                  `Resume it with the question via subagent_resume instead.`,
+              },
+            ],
+            details: { id: running.id, name: running.name, error: "claude workers are not live-askable" },
+          };
+        }
+
+        const qid = randomUUID();
+        const q: QuestionPayload = {
+          qid,
+          from: "parent",
+          question: params.question,
+          ...(params.details ? { details: params.details } : {}),
+          ...(params.options?.length ? { options: params.options as QuestionOption[] } : {}),
+          ...(typeof params.multiSelect === "boolean" ? { multiSelect: params.multiSelect } : {}),
+          ts: Date.now(),
+        };
+        writeQuestion(running.sessionFile, q);
+
+        // Inject the question into the child TUI. Single line on purpose:
+        // the child's input box queues it until the current turn boundary.
+        const optionsText =
+          params.options?.length
+            ? ` Options: ${params.options.map((o, i) => `${i + 1}. ${o.label}`).join("; ")}.`
+            : "";
+        const injected = `❓ Question from parent: ${params.question}${optionsText} Answer using the reply_to_parent tool (answer text as your answer parameter).`;
+        try {
+          sendCommand(running.surface, injected);
+        } catch (err: any) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Could not inject the question into sub-agent "${running.name}" (pane may be gone): ${err?.message ?? String(err)}`,
+              },
+            ],
+            details: { id: running.id, name: running.name, error: "injection failed" },
+          };
+        }
+
+        const reply = await waitForReply(running.sessionFile, "parent-reply", qid, { signal });
+        if (reply.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Sub-agent "${running.name}" answered: ${reply.answer}` }],
+            details: { id: running.id, name: running.name, qid, answer: reply.answer },
+          };
+        }
+        const reason = reply.reason === "aborted" ? "you were interrupted" : `no answer within ${Math.round(questionTimeoutMs() / 60000)} minutes`;
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Sub-agent "${running.name}" did not answer: ${reason}. It may still answer later — the question file stays until it does.`,
+            },
+          ],
+          details: { id: running.id, name: running.name, qid, error: reply.reason },
+        };
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — ask: ") +
+            theme.fg("muted", String(args.question ?? "").slice(0, 60)),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.answer) {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details?.name ?? details?.id ?? "subagent")) +
+              theme.fg("dim", " — answered: ") +
+              theme.fg("muted", String(details.answer).slice(0, 80)),
+            0,
+            0,
+          );
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
     pi.registerTool({
@@ -2217,7 +2548,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ].join("\n"),
         });
 
-        // Register as a running subagent for widget tracking
+        // Register as a running subagent for widget tracking.
+        // Clear stale question sidecars from previous rounds of this session.
+        clearQuestionSidecars(params.sessionPath);
         const running: RunningSubagent = {
           id,
           name,
@@ -2250,6 +2583,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+
+            if (result.question) {
+              // Exit-based escalation (e.g. claude worker): resume with the answer.
+              const q = result.question;
+              pi.sendMessage(
+                {
+                  customType: "subagent_question",
+                  content:
+                    `Sub-agent "${result.name}" exited with a question and needs your answer (${formatElapsed(result.elapsed)}):\n\n` +
+                    `${formatQuestionForDisplay({ qid: q.qid, from: "worker", question: q.question, options: q.options, multiSelect: q.multiSelect, ts: 0 })}\n\n` +
+                    `If a human decision is required, first ask the user with ask_user_question. ` +
+                    `Then resume the sub-agent with the answer: subagent_resume {sessionPath: "${result.sessionFile}", message: "Answer to your question: <answer>"}.\n\n` +
+                    `Session: ${result.sessionFile}`,
+                  display: true,
+                  details: {
+                    name: result.name,
+                    qid: q.qid,
+                    question: q.question,
+                    ...(q.options?.length ? { options: q.options } : {}),
+                    sessionFile: result.sessionFile,
+                  },
+                },
+                { triggerTurn: true, deliverAs: "steer" },
+              );
+              return;
+            }
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;

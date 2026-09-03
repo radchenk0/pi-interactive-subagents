@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import askUserQuestionModule from "../pi-extension/ask-user-question.ts";
 
 import {
   getLeafId,
@@ -1183,7 +1184,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_done,ask_parent,reply_to_parent",
     );
   });
 
@@ -1441,6 +1442,111 @@ describe("cmux.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+
+  it("decodes question payloads (exit-based escalation)", () => {
+    assert.deepEqual(
+      interpretExitSidecar({
+        type: "question",
+        qid: "abc-123",
+        question: "Which DB should I use?",
+        options: [{ label: "SQLite (Recommended)", value: "sqlite" }],
+        multiSelect: false,
+      }),
+      {
+        reason: "question",
+        exitCode: 0,
+        question: {
+          qid: "abc-123",
+          question: "Which DB should I use?",
+          options: [{ label: "SQLite (Recommended)", value: "sqlite" }],
+          multiSelect: false,
+        },
+      },
+    );
+  });
+
+  it("treats a malformed question payload (empty question) as done", () => {
+    assert.deepEqual(
+      interpretExitSidecar({ type: "question", qid: "abc", question: "   " }),
+      { reason: "done", exitCode: 0 },
+    );
+  });
+});
+
+describe("question-channel", () => {
+  let dir: string;
+  let sessionFile: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "question-channel-"));
+    sessionFile = join(dir, "test-session.jsonl");
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("round-trips question and answer sidecars atomically", async () => {
+    const { writeQuestion, readQuestion, writeAnswer, readAnswer, clearQuestionSidecars } =
+      await import("../pi-extension/subagents/question-channel.ts");
+    const q = {
+      qid: "q1",
+      from: "worker" as const,
+      question: "Which one?",
+      options: [{ label: "A", value: "a" }],
+      multiSelect: false,
+      ts: 123,
+    };
+    writeQuestion(sessionFile, q);
+    assert.deepEqual(readQuestion(sessionFile), q);
+
+    writeAnswer(sessionFile, { qid: "q1", answer: "Pick A", ts: 456 });
+    assert.deepEqual(readAnswer(sessionFile), { qid: "q1", answer: "Pick A", ts: 456 });
+
+    clearQuestionSidecars(sessionFile);
+    assert.equal(readQuestion(sessionFile), null);
+    assert.equal(readAnswer(sessionFile), null);
+  });
+
+  it("waitForReply accepts only the matching qid and resolves on answer", async () => {
+    const { writeAnswer, waitForReply } = await import("../pi-extension/subagents/question-channel.ts");
+    const p = waitForReply(sessionFile, "answer", "target-qid", { timeoutMs: 2000 });
+    // A stale answer from a previous round must be ignored.
+    writeAnswer(sessionFile, { qid: "stale-qid", answer: "old", ts: 1 });
+    await new Promise((r) => setTimeout(r, 700));
+    writeAnswer(sessionFile, { qid: "target-qid", answer: "fresh", ts: 2 });
+    const res = await p;
+    assert.deepEqual(res, { ok: true, answer: "fresh" });
+  });
+
+  it("waitForReply times out without an answer", async () => {
+    const { waitForReply } = await import("../pi-extension/subagents/question-channel.ts");
+    const res = await waitForReply(sessionFile, "answer", "never", { timeoutMs: 300 });
+    assert.deepEqual(res, { ok: false, reason: "timeout" });
+  });
+
+  it("waitForReply aborts on signal", async () => {
+    const { waitForReply } = await import("../pi-extension/subagents/question-channel.ts");
+    const ac = new AbortController();
+    const p = waitForReply(sessionFile, "parent-reply", "q", { timeoutMs: 5000, signal: ac.signal });
+    setTimeout(() => ac.abort(), 100);
+    const res = await p;
+    assert.deepEqual(res, { ok: false, reason: "aborted" });
+  });
+
+  it("formatQuestionForDisplay renders details, options and the question", async () => {
+    const { formatQuestionForDisplay } = await import("../pi-extension/subagents/question-channel.ts");
+    const text = formatQuestionForDisplay({
+      qid: "q",
+      from: "worker",
+      question: "Pick a DB?",
+      details: "Context here",
+      options: [{ label: "SQLite", description: "embedded" }, { label: "Postgres" }],
+      ts: 0,
+    });
+    assert.match(text, /Context here/);
+    assert.match(text, /1\. SQLite — embedded/);
+    assert.match(text, /2\. Postgres/);
+    assert.match(text, /Pick a DB\?/);
   });
 });
 describe("commands", () => {

@@ -1,0 +1,53 @@
+#!/bin/sh
+# pi-escalate — exit-based question escalation for claude-CLI subagents.
+#
+# Usage:
+#   pi-escalate "question" ["json-options-array"]
+#
+# Writes a `.exit` sidecar file next to $PI_SUBAGENT_SESSION containing a
+# structured question. The parent's poll loop detects it (reason: "question"),
+# delivers the question as a steer, and resumes this session with the answer
+# via subagent_resume.
+#
+# After calling this, stop working and end your turn.
+
+set -u
+
+if [ -z "${PI_SUBAGENT_SESSION:-}" ]; then
+  echo "pi-escalate: PI_SUBAGENT_SESSION is not set" >&2
+  exit 2
+fi
+
+question="${1:-}"
+if [ -z "$question" ]; then
+  echo "usage: pi-escalate \"question\" [json-options-array]" >&2
+  exit 2
+fi
+
+# JSON-encode the question (handles quotes, newlines, unicode).
+esc=$(printf '%s' "$question" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()), end="")') || exit 2
+
+# Optional second argument: JSON array of {label, value?, description?}.
+opts='[]'
+if [ "${2:-}" != "" ]; then
+  parsed=$(printf '%s' "$2" | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, list):
+        print(json.dumps(d), end="")
+except Exception:
+    pass
+' 2>/dev/null)
+  [ -n "$parsed" ] && opts="$parsed"
+fi
+
+qid=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null) || qid="q-$(date +%s)-$$"
+ts=$(date +%s)000
+
+exitFile="${PI_SUBAGENT_SESSION}.exit"
+printf '{"type":"question","qid":"%s","question":%s,"options":%s,"ts":%s}\n' \
+  "$qid" "$esc" "$opts" "$ts" > "$exitFile"
+
+echo "Question escalated to the parent (qid: ${qid}). Stop working and end your turn now."
+exit 0

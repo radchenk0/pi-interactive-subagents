@@ -277,6 +277,36 @@ for (const backend of backends) {
       );
     });
 
+    it("subagent ask_parent round-trips an answer via answer_subagent", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-ask-${id}.txt`;
+      trackTempFile(env, markerFile);
+      const answer = `ANSWER42_${id}`;
+
+      const surface = createTrackedSurface(env, `ask-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Do exactly this, in order:`,
+        `1. Call the subagent tool with these EXACT parameters:`,
+        `   name: "Asker-${id}"`,
+        `   agent: "test-asker"`,
+        `   task: "Ask: Integration question ${id} → ${markerFile}"`,
+        `2. When a question from the sub-agent arrives (a subagent_question message), call the answer_subagent tool with name "Asker-${id}" and answer "${answer}".`,
+        `3. After the sub-agent's final result arrives, say ASK_DONE.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      // The child asks the parent; the parent answers via answer_subagent; the
+      // child writes the answer text to the marker file and exits.
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /ANSWER42/);
+      assert.ok(
+        content.includes(answer),
+        `Marker should contain the parent's answer. Got: ${content}`,
+      );
+    });
+
     // ── Agent discovery ──
 
     it("subagent discovers project-local test agents", async () => {

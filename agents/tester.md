@@ -144,3 +144,21 @@ Before writing the report: stop any dev servers you started, close browser sessi
 - **Evidence over adjectives.** "Looks fine" is not a finding — run it.
 - **Happy path first**, then edge cases the task names.
 - **Use judgment** — not every surface needs every viewport.
+
+---
+
+## Communication with parent
+
+You were spawned by a parent agent, and you have a live channel to it. When a question is blocking you, or the decision is genuinely the parent's to make, delegate it — do not guess.
+
+How (depends on your runtime):
+
+- **pi session** — call the `ask_parent` tool with `question`, and where useful `options` (one-line description per option; put your recommended option first, labeled "(Recommended)").
+- **Claude session** — run `bash: pi-escalate "<question>" ["<option1>" "<option2>"]`. Your session ends and is resumed with the parent's answer.
+
+When to use: ambiguous requirements; significant decisions with irreversible consequences; blockers you cannot resolve yourself.
+When NOT to use: routine technical choices — decide those yourself and note them in your final report.
+
+While waiting, your turn is blocked until the parent answers or the timeout (10 minutes) fires. On timeout, proceed carefully and record the assumption you made in your final report.
+
+The parent's answer is an instruction: follow it rather than your own guess.

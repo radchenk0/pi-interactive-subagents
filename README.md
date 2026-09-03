@@ -93,8 +93,13 @@ For richer herdr integration (authoritative lifecycle states + native session re
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_kill`      | Kill a stalled subagent: close the pane, clear the entry, emit a final result               |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `ask_subagent`       | Ask a question to a running pi sub-agent; blocks until it answers or times out              |
+| `answer_subagent`    | Deliver an answer to a sub-agent blocked in its `ask_parent` call                           |
+
+**Subagent-only tools:** `caller_ping`, `subagent_done`, `ask_parent` (blocking question to the parent), `reply_to_parent` (answers a parent `ask_subagent`).
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -257,6 +262,31 @@ await caller_ping({
 ```
 
 > **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+
+---
+
+## Communication with sub-agents
+
+Beyond the exit-based `caller_ping`, agents can communicate **live** over a file-based RPC channel (sidecar files next to the child session file, polled every 500 ms).
+
+**Child → parent (live, blocking):** the child calls `ask_parent` with a question (and optional options, recommended one first). The child's turn **blocks** until the parent answers (default timeout: 10 minutes, configurable via `PI_SUBAGENT_QUESTION_TIMEOUT_MS`). The parent receives a `subagent_question` steer and answers with `answer_subagent` — the child's turn continues immediately with the answer. On timeout the child proceeds with its best judgment and records the assumption in its final report.
+
+**Parent → child (live, blocking):** the parent calls `ask_subagent` — the question is injected into the child's terminal; the child answers with its `reply_to_parent` tool and the `ask_subagent` call returns with the answer.
+
+**Claude workers** cannot make live blocking calls, so they escalate via the bundled `pi-escalate` helper (written into their system prompt): it writes a structured question sidecar, the child exits, the parent is notified, and resumes the session with the answer via `subagent_resume` — the same flow as `caller_ping`.
+
+**Escalation to a human** is always the parent model's own decision (it can use its `ask_user_question` tool) — the channel never forces it.
+
+```typescript
+// Parent side
+await ask_subagent({ name: "Worker", question: "Which DB driver?", options: [...] }); // blocks
+await answer_subagent({ name: "Worker", answer: "Use pg" }); // child unblocks
+
+// Child side
+const res = await ask_parent({ question: "v1 or v2 migration?", options: [{ label: "v2 (Recommended)" }] }); // blocks
+```
+
+Both directions respect the same 10-minute default timeout and the qid-matched sidecar protocol, so stale files from previous rounds can never answer a live wait.
 
 ---
 

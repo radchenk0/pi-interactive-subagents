@@ -18,6 +18,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
   getAvailableBackends,
@@ -328,5 +329,100 @@ for (const backend of backends) {
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
       assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
     });
+
+    // ── External pane-kill detection (regression: entry used to stall forever) ──
+
+    it(
+      "detects an externally killed pane and reports a crash instead of stalling",
+      { timeout: PI_TIMEOUT * 2 },
+      async () => {
+        if (backend !== "herdr") {
+          console.log("skipping: external-kill detection integration test only runs on herdr");
+          return;
+        }
+
+        const listPanes = (): any[] => {
+          const r = spawnSync("herdr", ["pane", "list"], {
+            encoding: "utf8",
+            timeout: 10_000,
+          });
+          const parsed = JSON.parse(r.stdout ?? "{}");
+          return parsed.result?.panes ?? [];
+        };
+
+        const id = uniqueId();
+        const surface = createTrackedSurface(env, `kill-${id}`);
+        await sleep(1000);
+
+        // Only consider panes in the parent's workspace so unrelated panes
+        // never confuse the child-pane detection below.
+        const parentPane = listPanes().find((p: any) => p.pane_id === surface);
+        assert.ok(parentPane, "parent surface should be a herdr pane");
+        const workspaceId = parentPane.workspace_id;
+        const workspacePaneIds = () =>
+          new Set(
+            listPanes()
+              .filter((p: any) => p.workspace_id === workspaceId)
+              .map((p: any) => p.pane_id),
+          );
+
+        const before = workspacePaneIds();
+
+        const task = [
+          `Call the subagent tool with these EXACT parameters:`,
+          `  name: "KillMe-${id}"`,
+          `  agent: "test-echo"`,
+          `  task: "Run this bash command: sleep 300"`,
+          `Do not do anything else. Just call the subagent tool once.`,
+        ].join("\n");
+
+        startPi(surface, env.dir, task);
+
+        // Wait for the child pane to appear
+        let childPane: string | null = null;
+        const foundBy = Date.now() + PI_TIMEOUT;
+        while (Date.now() < foundBy) {
+          await sleep(1000);
+          for (const paneId of workspacePaneIds()) {
+            if (!before.has(paneId) && paneId !== surface) {
+              childPane = paneId;
+              break;
+            }
+          }
+          if (childPane) break;
+        }
+        assert.ok(childPane, "child subagent pane should have appeared");
+
+        // Let the child pi process start so the foreground group is the agent.
+        await sleep(8000);
+
+        // Kill the child the way the bug repro did: SIGKILL so the pane
+        // vanishes with no sentinel and no .exit sidecar.
+        const infoRaw = spawnSync("herdr", ["pane", "process-info", "--pane", childPane], {
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        const proc = (JSON.parse(infoRaw.stdout ?? "{}").result?.process_info ?? {}) as any;
+        assert.ok(
+          Number.isInteger(proc.shell_pid),
+          `expected shell_pid in process-info, got: ${infoRaw.stdout}`,
+        );
+        if (Number.isInteger(proc.foreground_process_group_id)) {
+          try {
+            process.kill(-proc.foreground_process_group_id, "SIGKILL");
+          } catch {}
+        }
+        process.kill(proc.shell_pid, "SIGKILL");
+
+        // The watcher must notice the dead pane and report a crash result
+        // instead of the entry stalling in the parent's widget forever.
+        const screen = await waitForScreen(
+          surface,
+          /failed \(crashed\)|destroyed externally|failed \(exit 1\)/i,
+          PI_TIMEOUT,
+        );
+        assert.ok(screen.length > 0);
+      },
+    );
   });
 }

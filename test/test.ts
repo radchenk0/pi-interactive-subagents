@@ -33,6 +33,7 @@ import {
   selectZellijStackPlacement,
   getMuxBackend,
   herdrSplitDirection,
+  isSurfaceAlive,
   parseHerdrResult,
   balanceLayoutRatios,
   collectLayoutPaneIds,
@@ -1990,6 +1991,8 @@ describe("subagent interruption", () => {
   });
 });
 
+
+
 describe("subagent status renderer", () => {
   function createTheme() {
     return {
@@ -2907,6 +2910,77 @@ describe("herdr-native.ts", () => {
       });
       assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
     });
+  });
+});
+
+describe("pollForExit terminal detection", () => {
+  it("returns done when the child activity file reached phase=done", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-subagent-activity-"));
+    try {
+      const activityFile = join(dir, "activity.json");
+      writeFileSync(
+        activityFile,
+        `${JSON.stringify({
+          version: 1,
+          runningChildId: "a1",
+          phase: "done",
+          latestEvent: "session_shutdown",
+        })}\n`,
+      );
+
+      const result = await pollForExit("no-such-surface", new AbortController().signal, {
+        interval: 10,
+        activityFile,
+        isAlive: () => false,
+      });
+
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a crashed result when the pane is definitively gone", async () => {
+    const result = await pollForExit("no-such-surface", new AbortController().signal, {
+      interval: 10,
+      isAlive: () => false,
+      nativeSlowPath: async () => {
+        throw new Error("pane not found");
+      },
+    });
+
+    assert.equal(result.reason, "crashed");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage ?? "", /destroyed externally/);
+  });
+
+  it("keeps polling on transient read errors while the pane is alive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-subagent-transient-"));
+    try {
+      const sessionFile = join(dir, "child.jsonl");
+      const timer = setTimeout(() => {
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      }, 50);
+
+      const result = await pollForExit("no-such-surface", new AbortController().signal, {
+        interval: 10,
+        sessionFile,
+        isAlive: () => true,
+        nativeSlowPath: async () => {
+          throw new Error("transient herdr hiccup");
+        },
+      });
+
+      clearTimeout(timer);
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("isSurfaceAlive reports false for a missing herdr pane", () => {
+    if (getMuxBackend() !== "herdr") return;
+    assert.equal(isSurfaceAlive("w9:p999"), false);
   });
 });
 

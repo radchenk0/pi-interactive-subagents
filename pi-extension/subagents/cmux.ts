@@ -1592,6 +1592,55 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
+ * Check whether a surface (pane) still exists.
+ *
+ * Returns true when the pane exists, false when the backend definitively
+ * reports it as gone (e.g. herdr `pane_not_found`), and null when the answer
+ * is unknown (transient CLI error, backend without a reliable list API).
+ * Callers must only treat `false` as terminal; `null` means "keep polling".
+ */
+export function isSurfaceAlive(surface: string): boolean | null {
+  let backend: MuxBackend;
+  try {
+    backend = requireMuxBackend();
+  } catch {
+    return null;
+  }
+
+  if (backend === "herdr") {
+    try {
+      herdrCli(["pane", "get", surface]);
+      return true;
+    } catch (error: any) {
+      const message = String(error?.message ?? error);
+      return /not found|pane_not_found/i.test(message) ? false : null;
+    }
+  }
+
+  if (backend === "tmux") {
+    try {
+      execFileSync("tmux", ["list-panes", "-t", surface], { encoding: "utf8" });
+      return true;
+    } catch (error: any) {
+      const message = String(error?.stderr ?? error?.message ?? error);
+      return /can't find pane|no pane/i.test(message) ? false : null;
+    }
+  }
+
+  if (backend === "zellij") {
+    try {
+      const panes = readZellijPanes();
+      return panes.some((pane) => pane.id === zellijPaneId(surface));
+    } catch {
+      return null;
+    }
+  }
+
+  // cmux / wezterm: no reliable single-pane existence check — unknown.
+  return null;
+}
+
+/**
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
@@ -1626,7 +1675,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "crashed";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1680,6 +1729,20 @@ export async function pollForExit(
      * throws, the screen fallback is used (raw path) for the rest of the run.
      */
     nativeSlowPath?: (surface: string) => Promise<{ exitCode: number } | null>;
+    /**
+     * Child activity file (subagent-activity/<id>.json). When it reaches the
+     * terminal `phase: "done"` state (session_shutdown / subagent_done /
+     * caller_ping / auto-exit), the child process has shut down — treat the
+     * run as finished even if the sentinel was never observed (e.g. the pane
+     * was destroyed right after shutdown).
+     */
+    activityFile?: string;
+    /**
+     * Pane liveness check. `false` (definitively gone) makes the read-failure
+     * path terminal; `null` (unknown) keeps polling. Defaults to
+     * isSurfaceAlive().
+     */
+    isAlive?: (surface: string) => boolean | null;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -1698,6 +1761,20 @@ export async function pollForExit(
           const data = JSON.parse(readFileSync(exitFile, "utf8"));
           rmSync(exitFile, { force: true });
           return interpretExitSidecar(data);
+        }
+      } catch {}
+    }
+
+    // Fast path: child activity file reached the terminal "done" phase.
+    // Covers the case where the child process exited (and recorded
+    // session_shutdown) but the wrapper sentinel was never observed.
+    if (options.activityFile) {
+      try {
+        if (existsSync(options.activityFile)) {
+          const data = JSON.parse(readFileSync(options.activityFile, "utf8"));
+          if (data && data.phase === "done") {
+            return { reason: "done", exitCode: 0 };
+          }
         }
       } catch {}
     }
@@ -1734,7 +1811,7 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: sentinel.exitCode };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      // Surface read failed. The .exit file may have appeared in the meantime.
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
@@ -1744,6 +1821,22 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+
+      // Terminal "pane gone" detection: the read path keeps throwing AND the
+      // backend definitively reports the pane as gone (e.g. the pane or its
+      // wrapper process was destroyed externally). No sentinel can ever
+      // appear, so stop polling and report a crash instead of looping forever.
+      // Transient errors report `null` and the loop continues.
+      const alive = (options.isAlive ?? isSurfaceAlive)(surface);
+      if (alive === false) {
+        return {
+          reason: "crashed",
+          exitCode: 1,
+          errorMessage:
+            "Subagent pane was destroyed externally — the pane no longer exists. " +
+            "The session file is preserved; resume it with subagent_resume.",
+        };
       }
     }
 

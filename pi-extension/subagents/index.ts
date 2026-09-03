@@ -582,13 +582,23 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "crashMessage"
   >,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
+
+  if (result.crashMessage) {
+    // The pane died externally (killed, terminal closed, ...) — not a
+    // provider/agent error. The summary already carries the crash note and
+    // whatever output the subagent produced before dying.
+    return (
+      `Sub-agent "${name}" crashed after ${formatElapsed(result.elapsed)}.\n\n` +
+      `${result.summary}${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -623,6 +633,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** Crash cause when the subagent's pane died externally (not a provider error). */
+  crashMessage?: string;
   ping?: { name: string; message: string };
 }
 
@@ -1438,6 +1450,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      activityFile: running.activityFile,
       onTick() {
         observeRunningSubagent(running);
       },
@@ -1476,32 +1489,50 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      try {
+        closeSurface(surface);
+      } catch {
+        // Pane may already be gone (e.g. destroyed externally) — the result
+        // is still valid; do not mask it with a close error.
+      }
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // Pi subagent result extraction
+    const crashMessage = result.reason === "crashed" ? result.errorMessage : undefined;
     let summary: string;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
+        (crashMessage
+          ? `Subagent error: ${crashMessage}`
+          : result.errorMessage
+            ? `Subagent error: ${result.errorMessage}`
+            : result.exitCode !== 0
+              ? `Sub-agent exited with code ${result.exitCode}`
+              : "Sub-agent exited without output");
+    } else {
+      summary = crashMessage
+        ? `Subagent error: ${crashMessage}`
+        : result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
             ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
-    } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+            : "Sub-agent exited without output";
+    }
+    if (crashMessage) {
+      summary = `⚠ ${crashMessage}\n\n${summary}`;
     }
 
-    closeSurface(surface);
+    try {
+      closeSurface(surface);
+    } catch {
+      // Pane may already be gone (e.g. destroyed externally) — the result
+      // is still valid; do not mask it with a close error.
+    }
     runningSubagents.delete(running.id);
 
     return {
@@ -1513,6 +1544,7 @@ async function watchSubagent(
       elapsed,
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(crashMessage ? { crashMessage } : {}),
     };
   } catch (err: any) {
     try {
@@ -1683,6 +1715,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.crashMessage ? { crashMessage: result.crashMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 },
               },
@@ -2123,6 +2156,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.crashMessage ? { crashMessage: result.crashMessage } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2206,6 +2240,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
         const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
+        const crashMessage = typeof details.crashMessage === "string" ? details.crashMessage : "";
         const failed = exitCode !== 0 || !!errorMessage;
         const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
@@ -2216,9 +2251,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           : theme.fg("success", "✓");
         const status = errorMessage
           ? "failed (provider/agent error)"
-          : failed
-            ? `failed (exit ${exitCode})`
-            : "completed";
+          : crashMessage
+            ? "failed (crashed)"
+            : failed
+              ? `failed (exit ${exitCode})`
+              : "completed";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
 
         const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
@@ -2229,6 +2266,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .replace(/\n\nSession: .+\nResume: .+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
+          .replace(`Sub-agent "${name}" crashed after ${elapsed}.\n\n`, "")
           .replace(
             new RegExp(
               `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,

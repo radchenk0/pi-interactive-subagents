@@ -1710,12 +1710,18 @@ async function watchSubagent(
     } catch {}
     runningSubagents.delete(running.id);
 
-    if (signal.aborted) {
+    const moduleAborted = getModuleAbortSignal().aborted;
+    if (signal.aborted || moduleAborted) {
       const killed = running.killRequested === true;
       return {
         name,
         task,
-        summary: killed ? "Subagent killed by the caller." : "Subagent cancelled.",
+        summary:
+          killed
+            ? "Subagent killed by the caller."
+            : moduleAborted && !signal.aborted
+              ? "Subagent cancelled (session ended)."
+              : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: killed ? "killed" : "cancelled",
@@ -1739,6 +1745,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // Session switches (/new, /resume, /fork, /reload) fire session_shutdown,
+    // which aborts the module-level poll AbortController. Without re-import the
+    // aborted controller would survive into the new session and kill every
+    // subagent on its first poll tick ("Aborted while waiting for subagent to
+    // finish"). Re-create it so polling works in the next session too.
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
   });
 
   // Clean up on session shutdown

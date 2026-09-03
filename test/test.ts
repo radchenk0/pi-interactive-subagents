@@ -3195,3 +3195,34 @@ describe("agent frontmatter env interpolation", () => {
     }
   });
 });
+
+describe("ask_user_question registration", () => {
+  it("registers the ask_user_question tool in the main session", () => {
+    delete process.env.PI_SUBAGENT_ID;
+    const { api, registeredTools } = createMockExtensionApi();
+    askUserQuestionModule(api);
+    assert.ok(
+      registeredTools.some((tool) => tool.name === "ask_user_question"),
+      "expected ask_user_question to be registered",
+    );
+  });
+
+  it("registers no tools in a sub-agent session (PI_SUBAGENT_ID set)", () => {
+    const prev = process.env.PI_SUBAGENT_ID;
+    process.env.PI_SUBAGENT_ID = "test-child";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      askUserQuestionModule(api);
+      assert.ok(
+        !registeredTools.some((tool) => tool.name === "ask_user_question"),
+        "ask_user_question must not be registered in sub-agent sessions",
+      );
+    } finally {
+      if (prev === undefined) {
+        delete process.env.PI_SUBAGENT_ID;
+      } else {
+        process.env.PI_SUBAGENT_ID = prev;
+      }
+    }
+  });
+});

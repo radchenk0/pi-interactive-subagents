@@ -23,7 +23,8 @@
   },
   "pi": {
     "extensions": [
-      "./pi-extension/subagents/index.ts"
+      "./pi-extension/subagents/index.ts",
+      "./pi-extension/ask-user-question.ts"
     ]
   },
   "devDependencies": {

@@ -1789,14 +1789,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane to execute a task in the background. " +
+        "This is the PREFERRED way to spawn worker agents: whenever the user asks to spawn, launch, or delegate agents/workers for one or more independent tasks (writing code, research, tests, docs), or whenever the deliverable is a RESULT rather than a long-lived agent the user will drive interactively, use this tool instead of launching agents manually (e.g. via shell or the herdr CLI) and blocking on completion. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent in a dedicated terminal multiplexer pane to execute a task in the background. " +
+        "This is the PREFERRED way to spawn worker agents: whenever the user asks to spawn, launch, or delegate agents/workers for one or more independent tasks (writing code, research, tests, docs), or whenever the deliverable is a RESULT rather than a long-lived agent the user will drive interactively, use this tool instead of launching agents manually (e.g. via shell or the herdr CLI) and blocking on completion. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +

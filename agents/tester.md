@@ -3,7 +3,7 @@ name: tester
 description: General QA tester — runs backend tests (unit/integration/API) with the project's tooling and tests frontend UIs via Playwright MCP. Produces structured P0-P3 reports.
 tools: read, bash, write, edit, mcp, mcpScript, mcp__playwright
 deny-tools: claude
-model: ${PI_SUBAGENT_MODEL_TESTER:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_TESTER:-litellm-local/qwen3.8-27b-fp8}
 thinking: low
 auto-exit: true
 system-prompt: append

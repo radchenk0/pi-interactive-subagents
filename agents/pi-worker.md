@@ -4,7 +4,7 @@ description: Worker implementation running as a pi subagent pane — implements 
 extends: worker
 tools: read, bash, write, edit, subagent
 deny-tools: claude
-model: ${PI_SUBAGENT_MODEL_PI_WORKER:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_PI_WORKER:-litellm-local/qwen3.8-27b-fp8}
 thinking: minimal
 auto-exit: true
 system-prompt: append

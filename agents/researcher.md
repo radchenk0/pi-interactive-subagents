@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings into a focused, well-sourced brief
 tools: web_search, fetch_content, bash
-model: ${PI_SUBAGENT_MODEL_RESEARCHER:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_RESEARCHER:-litellm-local/qwen3.8-27b-fp8}
 thinking: xhigh
 system-prompt: append
 auto-exit: true

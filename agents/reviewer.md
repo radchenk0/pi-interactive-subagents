@@ -3,7 +3,7 @@ name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
 tools: read, bash
 deny-tools: claude
-model: ${PI_SUBAGENT_MODEL_REVIEWER:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_REVIEWER:-litellm-local/qwen3.8-27b-fp8}
 thinking: medium
 spawning: false
 auto-exit: true

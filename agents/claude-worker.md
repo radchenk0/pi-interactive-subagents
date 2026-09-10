@@ -3,7 +3,7 @@ name: claude-worker
 description: Worker implementation running as a self-driving Claude Code session — same role and standards as pi-worker, executed by the claude CLI.
 extends: worker
 cli: claude
-model: ${PI_SUBAGENT_MODEL_WORKER_CLAUDE:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_WORKER_CLAUDE:-qwen3.8-27b-fp8}
 effort: low
 spawning: false
 auto-exit: true

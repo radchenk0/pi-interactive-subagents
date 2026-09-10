@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Interactive in-pane planner — interviews the user to uncover the real goal, pins down key decisions, then delivers a small tightly-scoped spec and a sliced plan. Never implements.
-model: ${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL}}
+model: ${PI_SUBAGENT_MODEL_PLANNER:-litellm-local/qwen3.8-27b-fp8}
 thinking: medium
 auto-exit: false
 system-prompt: append

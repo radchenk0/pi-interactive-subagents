@@ -34,7 +34,7 @@ Run the fast unit tests first — if these fail, skip integration tests:
 cd /Users/misha-radchenko/Skills/pi-interactive-subagents && node --test test/test.ts
 ```
 
-All 193 unit tests must pass. If any fail, stop and fix them before proceeding.
+All 163 unit tests must pass. If any fail, stop and fix them before proceeding.
 
 ## Step 3: Run Integration Tests
 
@@ -138,7 +138,7 @@ Print a final summary:
 ╭─────────────────────────────────────────────╮
 │ Integration Test Results                    │
 ├─────────────────────────────────────────────┤
-│ Unit tests:        193/193 ✅               │
+│ Unit tests:        163/163 ✅               │
 │ Mux surface:       8/8  ✅  [<backend>]     │
 │ Subagent lifecycle: 7/7  ✅  [<backend>]    │
 │ Session validation: X sessions verified ✅  │

@@ -69,6 +69,7 @@ import {
   nativeWaitSentinel,
   nativeAgentStatusMap,
   nativeAgentRename,
+  nativeReportAgentSession,
   nativeReportMetadata,
   nativeSendEscape,
   applyHerdrAgentIdentity,
@@ -3062,6 +3063,12 @@ describe("herdr-native.ts", () => {
         "--display-agent", "Worker",
         "--title", "do the thing",
       ]);
+    });
+
+    it("report* accepts empty stdout on success (herdr 0.8.0 fire-and-forget)", () => {
+      __herdrNativeTest__.setRunner(() => ({ ok: true, stdout: "", stderr: "" }));
+      assert.equal(nativeReportMetadata("w1:p1", "subagents:abc", {}), true);
+      assert.equal(nativeReportAgentSession("w1:p1", "subagents:abc", "worker-1", "/tmp/session.jsonl"), true);
     });
   });
 

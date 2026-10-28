@@ -262,6 +262,9 @@ function runCli(args: string[], timeoutMs: number):
   const runner = runnerOverride ?? defaultRunner;
   const r = runner(args, { timeoutMs });
   if (r.ok) {
+    // Success can be reported with empty stdout (e.g. `pane report-*` on
+    // herdr 0.8.0 — fire-and-forget, no JSON envelope on success).
+    if (r.stdout.trim() === "") return { result: {} };
     const envelope = parseEnvelope(r.stdout);
     if (!envelope) {
       return { error: `unparseable CLI output: ${r.stdout.slice(0, 200)}` };

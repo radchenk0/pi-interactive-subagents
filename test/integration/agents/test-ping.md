@@ -1,10 +1,8 @@
 ---
 name: test-ping
-description: Integration test agent — calls caller_ping instead of completing task
-model: vllm/qwen3.8-27b-fp8
+description: Integration test fixture — calls caller_ping instead of completing task
+model: vllm-litellm/qwen3.8-27b-fp8
 tools: read, bash
-spawning: false
-disable-model-invocation: true
 ---
 
 You are a test agent. When given ANY task, you must call the caller_ping tool with the message set to "PING: " followed by the task text you received.

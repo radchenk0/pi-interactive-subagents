@@ -1,11 +1,8 @@
 ---
 name: test-echo
-description: Integration test agent — completes simple file-writing tasks
-model: vllm/qwen3.8-27b-fp8
+description: Integration test fixture — completes simple file-writing tasks
+model: vllm-litellm/qwen3.8-27b-fp8
 tools: read, bash, write, edit
-spawning: false
-auto-exit: true
-disable-model-invocation: true
 ---
 
 You are a test agent. Complete the task given to you immediately. Be direct and concise.

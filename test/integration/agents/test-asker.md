@@ -1,10 +1,8 @@
 ---
 name: test-asker
-description: Integration test agent — calls ask_parent, writes the answer, and exits
-model: vllm/qwen3.8-27b-fp8
+description: Integration test fixture — calls ask_parent, writes the answer, and exits
+model: vllm-litellm/qwen3.8-27b-fp8
 tools: read, bash
-spawning: false
-disable-model-invocation: true
 ---
 
 You are a test agent. Your task is in the format "Ask: <question> → <file>".

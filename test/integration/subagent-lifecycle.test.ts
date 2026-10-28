@@ -35,8 +35,23 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
+  loadTestAgent,
   type TestEnv,
 } from "./harness.ts";
+
+/**
+ * Build explicit subagent spawn parameter lines from a test agent fixture.
+ * The fixture markdown body becomes the system prompt; the `tools:` field
+ * (if present) becomes the tools allowlist.
+ */
+function agentParams(name: string, indent = "  "): string {
+  const a = loadTestAgent(name);
+  const lines = [`model: "${TEST_MODEL}"`];
+  if (a.tools) lines.push(`tools: "${a.tools}"`);
+  lines.push(`systemPrompt: ${JSON.stringify(a.systemPrompt)}`);
+  return lines.map((l) => `${indent}${l}`).join("\n");
+}
 
 const backends = getAvailableBackends();
 
@@ -73,7 +88,7 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Echo-${id}"`,
-        `  agent: "test-echo"`,
+        `${agentParams("test-echo")}`,
         `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
@@ -125,7 +140,7 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Status-${id}"`,
-        `  agent: "test-echo"`,
+        `${agentParams("test-echo")}`,
         `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'"`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
@@ -172,12 +187,12 @@ for (const backend of backends) {
         ``,
         `First call:`,
         `  name: "ParaA-${id}"`,
-        `  agent: "test-echo"`,
+        `${agentParams("test-echo")}`,
         `  task: "Run: echo 'DONE_A_${id}' > '${fileA}'"`,
         ``,
         `Second call:`,
         `  name: "ParaB-${id}"`,
-        `  agent: "test-echo"`,
+        `${agentParams("test-echo")}`,
         `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
         ``,
         `Call both subagent tools NOW, do not wait between them.`,
@@ -256,7 +271,7 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
+        `${agentParams("test-ping")}`,
         `  task: "PING_TEST_${id}"`,
         `Just call the subagent tool once. Do not do anything else before calling it.`,
       ].join("\n");
@@ -290,7 +305,7 @@ for (const backend of backends) {
         `Do exactly this, in order:`,
         `1. Call the subagent tool with these EXACT parameters:`,
         `   name: "Asker-${id}"`,
-        `   agent: "test-asker"`,
+        `${agentParams("test-asker", "   ")}`,
         `   task: "Ask: Integration question ${id} → ${markerFile}"`,
         `2. When a question from the sub-agent arrives (a subagent_question message), call the answer_subagent tool with name "Asker-${id}" and answer "${answer}".`,
         `3. After the sub-agent's final result arrives, say ASK_DONE.`,
@@ -307,32 +322,32 @@ for (const backend of backends) {
       );
     });
 
-    // ── Agent discovery ──
+    // ── Explicit model + thinking ──
 
-    it("subagent discovers project-local test agents", async () => {
+    it("spawns a subagent with explicit model and thinking parameters", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
+      const markerFile = `/tmp/pi-integ-thinking-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `discovery-${id}`);
+      const surface = createTrackedSurface(env, `thinking-${id}`);
       await sleep(1000);
 
-      // Use subagents_list to verify test agents are discoverable,
-      // then spawn one to prove it works end-to-end.
+      // Model + thinking are passed as explicit spawn parameters (the
+      // thinking level is forwarded to pi's --thinking flag).
       const task = [
-        `First, call the subagents_list tool to see available agents.`,
-        `Then call the subagent tool:`,
-        `  name: "Disco-${id}"`,
-        `  agent: "test-echo"`,
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Think-${id}"`,
+        `  model: "${TEST_MODEL}"`,
+        `  thinking: "low"`,
+        `  systemPrompt: "You are a test agent. Just execute the task directly. Do not ask questions."`,
         `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
-      assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
+      assert.ok(content.includes(`DISCO_${id}`), `Thinking test marker should exist`);
     });
 
     // ── Subagent with custom system prompt ──
@@ -348,7 +363,6 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these parameters:`,
         `  name: "SysP-${id}"`,
-        `  agent: "test-echo"`,
         `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
         `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
@@ -401,7 +415,7 @@ for (const backend of backends) {
         const task = [
           `Call the subagent tool with these EXACT parameters:`,
           `  name: "KillMe-${id}"`,
-          `  agent: "test-echo"`,
+          `${agentParams("test-echo", "  ")}`,
           `  task: "Run this bash command: sleep 300"`,
           `Do not do anything else. Just call the subagent tool once.`,
         ].join("\n");

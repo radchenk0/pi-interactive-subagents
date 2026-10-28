@@ -115,6 +115,19 @@ const PROJECT_ROOT = resolve(HARNESS_DIR, "../..");
 const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
 
 /**
+ * Load a test agent fixture (test/integration/agents/<name>.md) as explicit
+ * spawn parameters: the markdown body becomes the system prompt, the
+ * `tools:` frontmatter field (if present) becomes the tools allowlist.
+ */
+export function loadTestAgent(name: string): { tools?: string; systemPrompt: string } {
+  const raw = readFileSync(join(TEST_AGENTS_SRC, `${name}.md`), "utf8");
+  const frontmatter = raw.match(/^---\n([\s\S]*?)\n---\n*/)?.[1] ?? "";
+  const tools = /^tools:\s*(.+)$/m.exec(frontmatter)?.[1]?.trim() || undefined;
+  const systemPrompt = raw.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  return { tools, systemPrompt };
+}
+
+/**
  * Absolute path to the extension source in the working tree.
  *
  * Integration tests must exercise the code on the current branch — NOT the
@@ -299,22 +312,10 @@ export interface TestEnv {
 }
 
 /**
- * Create an isolated test environment with test agent definitions.
- * The temp dir has `.pi/agents/` containing copies of all test agents.
+ * Create an isolated test environment.
  */
 export function createTestEnv(backend: MuxBackend): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
-  const agentsDir = join(dir, ".pi", "agents");
-  mkdirSync(agentsDir, { recursive: true });
-
-  // Copy test agent definitions into the project-local agents dir
-  if (existsSync(TEST_AGENTS_SRC)) {
-    for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
-      }
-    }
-  }
 
   return { dir, backend, surfaces: [], tempFiles: [] };
 }

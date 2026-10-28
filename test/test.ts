@@ -882,6 +882,23 @@ describe("subagent launch params", () => {
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", interactive: false }), false);
   });
 
+  it("resolveEffectiveModel: param wins, PI_SUBAGENT_MODEL is the global fallback", () => {
+    const prev = process.env.PI_SUBAGENT_MODEL;
+    try {
+      process.env.PI_SUBAGENT_MODEL = "prov/fallback-model";
+      assert.equal(testApi.resolveEffectiveModel("prov/explicit"), "prov/explicit");
+      assert.equal(testApi.resolveEffectiveModel(undefined), "prov/fallback-model");
+      assert.equal(testApi.resolveEffectiveModel(""), "prov/fallback-model");
+
+      delete process.env.PI_SUBAGENT_MODEL;
+      assert.equal(testApi.resolveEffectiveModel(undefined), undefined);
+      assert.equal(testApi.resolveEffectiveModel("prov/explicit"), "prov/explicit");
+    } finally {
+      if (prev === undefined) delete process.env.PI_SUBAGENT_MODEL;
+      else process.env.PI_SUBAGENT_MODEL = prev;
+    }
+  });
+
   it("resolves launch behavior: standalone by default, fork via param", () => {
     const standalone = testApi.resolveLaunchBehavior({ name: "A", task: "T" });
     assert.equal(standalone.sessionMode, "standalone");

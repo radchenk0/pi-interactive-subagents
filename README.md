@@ -214,7 +214,7 @@ subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `systemPrompt`         | string  | —              | Appended to the child's system prompt (identity/role)                                             |
-| `model`                | string  | —              | Model pin (`provider/model`); default: the child's own default model                              |
+| `model`                | string  | `PI_SUBAGENT_MODEL` | Model pin (`provider/model`). Fallback order: param → `PI_SUBAGENT_MODEL` env var → the child's own default model |
 | `thinking`             | string  | —              | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`                         |
 | `skills`               | string  | —              | Comma-separated skill names to invoke in the child                                                |
 | `tools`                | string  | —              | Comma-separated native pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Subagent control tools (`subagent_done`, `ask_parent`, …) are always included. |

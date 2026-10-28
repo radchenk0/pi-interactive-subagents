@@ -229,6 +229,14 @@ function resolveEffectiveInteractive(params: Static<typeof SubagentParams>): boo
   return params.interactive ?? false;
 }
 
+/**
+ * Model resolution: the explicit `model` param wins; PI_SUBAGENT_MODEL is
+ * the global fallback for all subagents; otherwise the child's own default.
+ */
+export function resolveEffectiveModel(paramModel?: string): string | undefined {
+  return paramModel || process.env.PI_SUBAGENT_MODEL || undefined;
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -855,6 +863,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveModel,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -892,7 +901,9 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const effectiveModel = params.model;
+  // Model resolution: explicit param wins, PI_SUBAGENT_MODEL is the global
+  // fallback (see resolveEffectiveModel).
+  const effectiveModel = resolveEffectiveModel(params.model);
   const effectiveTools = params.tools;
   const effectiveSkills = params.skills;
   const effectiveThinking = params.thinking;

@@ -34,7 +34,7 @@ Run the fast unit tests first — if these fail, skip integration tests:
 cd /Users/misha-radchenko/Skills/pi-interactive-subagents && node --test test/test.ts
 ```
 
-All 141 unit tests must pass. If any fail, stop and fix them before proceeding.
+All 193 unit tests must pass. If any fail, stop and fix them before proceeding.
 
 ## Step 3: Run Integration Tests
 
@@ -42,13 +42,13 @@ Run the two suites sequentially (no LLM needed for mux-surface; LLM needed for s
 
 ```bash
 cd /Users/misha-radchenko/Skills/pi-interactive-subagents
-PI_TEST_MODEL=vllm/qwen3.8-27b-fp8 node --test --test-concurrency=1 \
+PI_TEST_MODEL=vllm-litellm/qwen3.8-27b-fp8 node --test --test-concurrency=1 \
   test/integration/mux-surface.test.ts test/integration/subagent-lifecycle.test.ts
 ```
 
 `--test-concurrency=1` is required: the focus-preservation test asserts global mux state and would race against parallel suites.
 
-`PI_TEST_MODEL` must be a model available on this machine — this fork runs on the local `vllm` provider only (no Anthropic).
+`PI_TEST_MODEL` must be a model available on this machine — this fork runs on the local `vllm-litellm` provider only (no Anthropic).
 
 Timeout: 10 minutes.
 
@@ -57,9 +57,9 @@ Timeout: 10 minutes.
 | Suite | Tests | Approx Duration |
 |-------|-------|-----------------|
 | `mux-surface` | 8 | ~50s |
-| `subagent-lifecycle` | 7 | ~180s |
+| `subagent-lifecycle` | 9 | ~180s |
 
-All 15 tests must pass, each parametrized per detected backend (e.g. `[herdr]`, `[cmux]`). If any fail, report the failure output and stop.
+All 17 tests must pass, each parametrized per detected backend (e.g. `[herdr]`, `[cmux]`). If any fail, report the failure output and stop.
 
 The long-running `keeps a long active tool call from surfacing false stalled status` test in `subagent-lifecycle` runs ~100s on its own.
 
@@ -138,7 +138,7 @@ Print a final summary:
 ╭─────────────────────────────────────────────╮
 │ Integration Test Results                    │
 ├─────────────────────────────────────────────┤
-│ Unit tests:        141/141 ✅               │
+│ Unit tests:        193/193 ✅               │
 │ Mux surface:       8/8  ✅  [<backend>]     │
 │ Subagent lifecycle: 7/7  ✅  [<backend>]    │
 │ Session validation: X sessions verified ✅  │

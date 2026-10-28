@@ -899,6 +899,75 @@ describe("subagent launch params", () => {
     }
   });
 
+  describe("resolveSpawnAllowed", () => {
+    const prevId = process.env.PI_SUBAGENT_ID;
+    const prevFlag = process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+
+    after(() => {
+      if (prevId === undefined) delete process.env.PI_SUBAGENT_ID;
+      else process.env.PI_SUBAGENT_ID = prevId;
+      if (prevFlag === undefined) delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      else process.env.PI_SUBAGENT_ALLOW_SPAWNING = prevFlag;
+    });
+
+    it("top-level sessions can always spawn", () => {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      assert.equal(testApi.resolveSpawnAllowed(), true);
+    });
+
+    it("sub-agent sessions cannot spawn by default", () => {
+      process.env.PI_SUBAGENT_ID = "child-1";
+      delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      assert.equal(testApi.resolveSpawnAllowed(), false);
+    });
+
+    it("sub-agent sessions can spawn with an explicit grant", () => {
+      process.env.PI_SUBAGENT_ID = "child-1";
+      process.env.PI_SUBAGENT_ALLOW_SPAWNING = "1";
+      assert.equal(testApi.resolveSpawnAllowed(), true);
+    });
+  });
+
+  describe("spawn tool registration gate", () => {
+    const prevId = process.env.PI_SUBAGENT_ID;
+    const prevFlag = process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+
+    after(() => {
+      if (prevId === undefined) delete process.env.PI_SUBAGENT_ID;
+      else process.env.PI_SUBAGENT_ID = prevId;
+      if (prevFlag === undefined) delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      else process.env.PI_SUBAGENT_ALLOW_SPAWNING = prevFlag;
+    });
+
+    function registeredToolNames() {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      return new Set(registeredTools.map((t: any) => t.name));
+    }
+
+    it("registers the spawning tools in top-level sessions", () => {
+      delete process.env.PI_SUBAGENT_ID;
+      delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      const names = registeredToolNames();
+      for (const name of testApi.SPAWNING_TOOLS) assert.ok(names.has(name), name);
+    });
+
+    it("withholds the spawning tools in sub-agent sessions", () => {
+      process.env.PI_SUBAGENT_ID = "child-1";
+      delete process.env.PI_SUBAGENT_ALLOW_SPAWNING;
+      const names = registeredToolNames();
+      for (const name of testApi.SPAWNING_TOOLS) assert.equal(names.has(name), false, name);
+    });
+
+    it("restores the spawning tools with an explicit grant", () => {
+      process.env.PI_SUBAGENT_ID = "child-1";
+      process.env.PI_SUBAGENT_ALLOW_SPAWNING = "1";
+      const names = registeredToolNames();
+      for (const name of testApi.SPAWNING_TOOLS) assert.ok(names.has(name), name);
+    });
+  });
+
   it("resolves launch behavior: standalone by default, fork via param", () => {
     const standalone = testApi.resolveLaunchBehavior({ name: "A", task: "T" });
     assert.equal(standalone.sessionMode, "standalone");

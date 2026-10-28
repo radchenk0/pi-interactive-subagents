@@ -131,11 +131,22 @@ function getModuleAbortSignal(): AbortSignal {
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  task: Type.String({
+    description:
+      "Task/prompt for the sub-agent. Make it self-contained: the sub-agent does not share your conversation unless fork: true. State the goal, the constraints, and what 'done' looks like.",
+  }),
   systemPrompt: Type.Optional(
-    Type.String({ description: "Appended to the sub-agent's system prompt (role instructions)" }),
+    Type.String({
+      description:
+        "Appended to the sub-agent's system prompt. Use for role instructions and task-specific rules.",
+    }),
   ),
-  model: Type.Optional(Type.String({ description: "Model for the sub-agent (provider/id)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model for the sub-agent as 'provider/id'. Falls back to the PI_SUBAGENT_MODEL env var when omitted, then to the sub-agent's own default model.",
+    }),
+  ),
   thinking: Type.Optional(
     Type.String({
       description: "Thinking level: off, minimal, low, medium, high, xhigh, max",
@@ -145,7 +156,10 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Comma-separated skills to load in the sub-agent" }),
   ),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tool allowlist for the sub-agent" }),
+    Type.String({
+      description:
+        "Comma-separated ALLOWLIST of tools the sub-agent may use. By default the sub-agent gets the standard pi toolset (read, write, edit, bash, ffgrep, fffind, web tools, installed extensions). The 4 control tools (subagent_done, caller_ping, ask_parent, reply_to_parent) are always present and cannot be removed. Use this to reduce the surface, not to grant extra power: it never adds spawning tools (see spawning).",
+    }),
   ),
   cwd: Type.Optional(
     Type.String({
@@ -165,6 +179,12 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. Defaults to false (autonomous: the parent is woken on stalls and expects a subagent_done result).",
     }),
   ),
+  spawning: Type.Optional(
+    Type.Boolean({
+      description:
+        "Allow this sub-agent to spawn further sub-agents. Off by default: sub-agent sessions do NOT get the subagent-spawning tools (subagent, subagent_resume, subagent_interrupt, subagent_kill, ask_subagent, answer_subagent). Set true only for orchestrator-style sub-agents that must delegate work further. The grant is not preserved across subagent_resume.",
+    }),
+  ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -174,6 +194,27 @@ const SubagentParams = Type.Object({
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
+
+/** Tools that spawn or drive sub-agents. Gated by resolveSpawnAllowed(). */
+const SPAWNING_TOOLS = new Set([
+  "subagent",
+  "subagent_interrupt",
+  "subagent_kill",
+  "subagent_resume",
+  "ask_subagent",
+  "answer_subagent",
+]);
+
+/**
+ * Whether the subagent-spawning tools are registered in this session.
+ * Top-level sessions always get them. Sub-agent sessions (PI_SUBAGENT_ID
+ * set by the spawner) only get them when the parent explicitly granted
+ * spawning (PI_SUBAGENT_ALLOW_SPAWNING=1, propagated from spawning: true).
+ */
+export function resolveSpawnAllowed(): boolean {
+  if (!process.env.PI_SUBAGENT_ID) return true;
+  return process.env.PI_SUBAGENT_ALLOW_SPAWNING === "1";
+}
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
@@ -864,6 +905,8 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   resolveEffectiveModel,
+  resolveSpawnAllowed,
+  SPAWNING_TOOLS,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1018,6 +1061,9 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  if (params.spawning === true) {
+    envParts.push(`PI_SUBAGENT_ALLOW_SPAWNING=1`);
+  }
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1283,7 +1329,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       .filter(Boolean),
   );
 
-  const shouldRegister = (name: string) => !deniedTools.has(name);
+  // Sub-agent sessions do not get the spawning tools unless the parent
+  // explicitly granted it (see resolveSpawnAllowed).
+  const spawnAllowed = resolveSpawnAllowed();
+
+  const shouldRegister = (name: string) =>
+    !deniedTools.has(name) && (!SPAWNING_TOOLS.has(name) || spawnAllowed);
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
@@ -1292,20 +1343,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane to execute a task in the background. " +
-        "This is the PREFERRED way to spawn worker agents: whenever the user asks to spawn, launch, or delegate agents/workers for one or more independent tasks (writing code, research, tests, docs), or whenever the deliverable is a RESULT rather than a long-lived agent the user will drive interactively, use this tool instead of launching agents manually (e.g. via shell or the herdr CLI) and blocking on completion. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status with any other tool. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "This is the PREFERRED way to delegate work: use it whenever the user asks to spawn, launch, or delegate agents/workers for one or more independent tasks (writing code, research, tests, docs), or whenever the deliverable is a RESULT rather than a conversation the user drives. " +
+        "\n\nASYNC PROTOCOL — " +
+        "This is a fire-and-forget tool: the call returns an immediate acknowledgement and your turn continues. " +
+        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn. " +
+        "DO NOT poll: no sleep/wait loops, no tail/watch scripts, no reading session/log files, no listing commands to check status — the harness handles delivery. " +
+        "DO NOT fabricate, assume, or summarize the result before the steer arrives. " +
+        "After spawning, either end your turn immediately or work on other independent tasks (including spawning more sub-agents in parallel). " +
+        "\n\nWHAT THE SUB-AGENT HAS — " +
+        "The sub-agent is a full pi agent in its own pane: " +
+        "the standard pi toolset (read, write, edit, bash, ffgrep, fffind, web tools, installed extensions) — the `tools` param is an allowlist that REDUCES that surface — " +
+        "PLUS 4 control tools the harness relies on: `subagent_done` (its ONLY way to finish with a result), `ask_parent` (asks you a question, blocks until you answer via answer_subagent), `reply_to_parent` (answers your ask_subagent question), `caller_ping` (signals you that it is parked and waiting for a follow-up). " +
+        "MINUS the subagent-spawning tools (unless spawning: true) and ask_user_question (a sub-agent never talks to the user directly — it must route questions through you via ask_parent). " +
+        "The sub-agent's session ends ONLY when it calls subagent_done (with its summary and session path) or the user closes the pane — it never auto-exits. " +
+        "Recursion is OFF by default: a sub-agent cannot spawn further sub-agents unless you pass spawning: true. " +
+        "\n\nPARAMETERS — " +
+        "Required: name, task (make the task self-contained: the sub-agent does not see your conversation unless fork: true). " +
+        "Optional: model ('provider/id'; falls back to PI_SUBAGENT_MODEL, then the child's default), thinking (off…max), systemPrompt (role instructions), skills, tools (allowlist), cwd (local .pi config / AGENTS.md / skills), fork (inherit this conversation), interactive (long-running, user-driven pane; parent not woken on stalls), spawning (grant further delegation), resumeSessionId. " +
+        "\n\nCONTROLLING A RUNNING SUB-AGENT — " +
+        "On a FAILED or cancelled steer, inspect the pane with subagent_resume (pass the session path) BEFORE judging the outcome; you can resume with fix instructions. " +
+        "ask_subagent asks a running sub-agent a multiple-choice question; answer_subagent delivers the answer to one that is parked waiting; subagent_interrupt sends Esc; subagent_kill terminates.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane to execute a task in the background. " +
-        "This is the PREFERRED way to spawn worker agents: whenever the user asks to spawn, launch, or delegate agents/workers for one or more independent tasks (writing code, research, tests, docs), or whenever the deliverable is a RESULT rather than a long-lived agent the user will drive interactively, use this tool instead of launching agents manually (e.g. via shell or the herdr CLI) and blocking on completion. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status with any other tool. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Spawn a background sub-agent in a dedicated pane — the preferred way to delegate independent tasks whose deliverable is a result. " +
+        "Fire-and-forget: the result arrives as an automatic steer message; do NOT poll, do NOT assume the outcome. " +
+        "Sub-agents get the standard pi toolset + 4 control tools (subagent_done, ask_parent, reply_to_parent, caller_ping); they cannot spawn further sub-agents unless spawning: true, and they finish only via subagent_done. " +
+        "On failure, inspect with subagent_resume before judging.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1827,7 +1889,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Use when a sub-agent was cancelled or needs follow-up work, and as the FIRST step after a FAILED or cancelled steer: inspect the pane to see where it got stuck, then resume with fix instructions. " +
+        "Note: the resumed session runs with a fresh environment — a spawning grant from the original spawn is not preserved, and the model stays whatever the session file has.",
       promptSnippet:
         "Resume a previous sub-agent session in a new multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +

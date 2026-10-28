@@ -217,11 +217,26 @@ subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the
 | `model`                | string  | `PI_SUBAGENT_MODEL` | Model pin (`provider/model`). Fallback order: param → `PI_SUBAGENT_MODEL` env var → the child's own default model |
 | `thinking`             | string  | —              | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`                         |
 | `skills`               | string  | —              | Comma-separated skill names to invoke in the child                                                |
-| `tools`                | string  | —              | Comma-separated native pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Subagent control tools (`subagent_done`, `ask_parent`, …) are always included. |
+| `tools`                | string  | —              | Comma-separated ALLOWLIST that narrows the child's tool surface (see below). Subagent control tools (`subagent_done`, `ask_parent`, `reply_to_parent`, `caller_ping`) are always included and cannot be removed. | 
 | `cwd`                  | string  | —              | Working directory for the sub-agent (absolute, or relative to the parent's cwd)                   |
 | `fork`                 | boolean | `false`        | Force a full-context fork for this spawn (the child inherits the parent's conversation)           |
 | `interactive`          | boolean | `false`        | Mark this spawn as user-driven: don't wake the parent on stall/recovery                           |
+| `spawning`             | boolean | `false`        | Allow this sub-agent to spawn further sub-agents. Off by default — see "What a sub-agent gets". The grant is not preserved across `subagent_resume`. |
 | `resumeSessionId`      | string  | —              | (Internal) resume a previous session by id — normally use `subagent_resume`                       |
+
+### What a sub-agent gets (its tool surface)
+
+A sub-agent is a full pi agent in its own pane, not a restricted runner:
+
+- **Standard pi toolset** — `read`, `write`, `edit`, `bash`, `ffgrep`, `fffind`, plus whatever global extensions are installed (web search, codemode, …). The `tools` param is an allowlist that **reduces** that surface; it cannot grant tools the child wouldn't already have.
+- **Plus 4 control tools**, always present (the harness depends on them):
+  - `subagent_done` — the **only** way the sub-agent finishes with a result (summary + session path). There is no auto-exit: the child's session ends only via `subagent_done` or the user closing the pane.
+  - `ask_parent` — asks the parent a question and blocks until the parent answers with `answer_subagent`.
+  - `reply_to_parent` — answers a question the parent asked via `ask_subagent`.
+  - `caller_ping` — signals the parent that the child is parked and waiting for a follow-up.
+- **Minus the subagent-spawning tools** — `subagent`, `subagent_resume`, `subagent_interrupt`, `subagent_kill`, `ask_subagent`, `answer_subagent` are **not registered** in a sub-agent session. Recursion is opt-in: pass `spawning: true` for orchestrator-style sub-agents that must delegate further. The grant travels as an env var of that one launch and is **not** preserved when the session is resumed later.
+- **Minus `ask_user_question`** — a sub-agent never talks to the user directly; questions route through the parent via `ask_parent`.
+- **Context isolation** — by default the child does **not** see the parent's conversation; the `task` prompt is its world. `fork: true` inherits the parent session instead. `systemPrompt` appends role instructions; `cwd` swaps in a different local `.pi/` config, AGENTS.md, and skills.
 
 ---
 

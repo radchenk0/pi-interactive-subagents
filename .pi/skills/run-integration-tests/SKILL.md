@@ -31,7 +31,7 @@ If no multiplexer is available, stop and tell the user to run inside one.
 Run the fast unit tests first — if these fail, skip integration tests:
 
 ```bash
-cd /Users/misha-radchenko/Projects/pi-interactive-subagents && node --test test/test.ts
+cd /Users/misha-radchenko/Skills/pi-interactive-subagents && node --test test/test.ts
 ```
 
 All 141 unit tests must pass. If any fail, stop and fix them before proceeding.
@@ -41,7 +41,7 @@ All 141 unit tests must pass. If any fail, stop and fix them before proceeding.
 Run the two suites sequentially (no LLM needed for mux-surface; LLM needed for subagent-lifecycle):
 
 ```bash
-cd /Users/misha-radchenko/Projects/pi-interactive-subagents
+cd /Users/misha-radchenko/Skills/pi-interactive-subagents
 PI_TEST_MODEL=vllm/qwen3.8-27b-fp8 node --test --test-concurrency=1 \
   test/integration/mux-surface.test.ts test/integration/subagent-lifecycle.test.ts
 ```

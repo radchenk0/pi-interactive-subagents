@@ -432,7 +432,8 @@ for (const backend of backends) {
           encoding: "utf8",
           timeout: 10_000,
         });
-        const proc = (JSON.parse(infoRaw.stdout ?? "{}").result?.process_info ?? {}) as any;
+        // herdr 0.9.x prints error envelopes on stderr — stdout can be empty.
+        const proc = (JSON.parse(infoRaw.stdout?.trim() || "{}").result?.process_info ?? {}) as any;
         assert.ok(
           Number.isInteger(proc.shell_pid),
           `expected shell_pid in process-info, got: ${infoRaw.stdout}`,

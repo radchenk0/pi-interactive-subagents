@@ -163,3 +163,11 @@ When NOT to use: routine technical choices — decide those yourself and note th
 While waiting, your turn is blocked until the parent answers or the timeout (10 minutes) fires. On timeout, proceed carefully and record the assumption you made in your final report.
 
 The parent's answer is an instruction: follow it rather than your own guess.
+
+---
+
+## Completion Protocol (REQUIRED)
+
+- Your **last action** must be a `subagent_done` tool call. **Never end your turn with plain text** — the parent session only receives your result when you finish through `subagent_done`.
+- Put your complete deliverable/summary in the assistant message immediately **before** the `subagent_done` call — that message is the result returned to the caller.
+- Even on failure or being blocked, still call `subagent_done` and report the problem in your summary. A silent exit loses your work.

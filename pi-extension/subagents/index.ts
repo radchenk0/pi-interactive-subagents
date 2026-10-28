@@ -1281,8 +1281,8 @@ async function launchSubagent(
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+    ? "Complete your task autonomously. When finished, your LAST action must be a subagent_done tool call — never end your turn with plain text, or your results will not be delivered."
+    : "Complete your task. When finished, your LAST action must be a call to the subagent_done tool — never end your turn with plain text, or your results will not be delivered. The user can interact with you at any time.";
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";

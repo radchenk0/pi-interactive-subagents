@@ -25,3 +25,11 @@ subagent({
 ```
 
 Wait for the result and continue. Don't research things you can grep in the codebase — just read the code.
+
+---
+
+## Completion Protocol (REQUIRED)
+
+- Your **last action** must be a `subagent_done` tool call. **Never end your turn with plain text** — the parent session only receives your result when you finish through `subagent_done`.
+- Put your complete deliverable/summary in the assistant message immediately **before** the `subagent_done` call — that message is the result returned to the caller.
+- Even on failure or being blocked, still call `subagent_done` and report the problem in your summary. A silent exit loses your work.

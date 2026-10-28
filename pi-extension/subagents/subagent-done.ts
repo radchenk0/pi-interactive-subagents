@@ -1,7 +1,8 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Shift+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Shows available tools as a styled widget above the editor (toggle with Ctrl+Shift+J)
+ * - Provides a `subagent_done` tool — the single way a subagent signals
+ *   completion; otherwise only a human closing the pane ends the session
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -17,34 +18,6 @@ import {
 } from "./question-channel.ts";
 import { randomUUID } from "node:crypto";
 
-export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
-  return agentStarted;
-}
-
-export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
-  messages: any[] | undefined,
-): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
-    }
-  }
-
-  return true;
-}
-
 export interface SubagentErrorInfo {
   errorMessage: string;
   stopReason: "error";
@@ -57,7 +30,7 @@ export interface SubagentErrorInfo {
  * failure instead of silently treating the run as completed.
  *
  * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * aborted by the user.
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -90,9 +63,7 @@ export default function (pi: ExtensionAPI) {
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
-  const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -104,7 +75,7 @@ export default function (pi: ExtensionAPI) {
       (_tui: any, theme: any) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
-        const label = subagentAgent || subagentName;
+        const label = subagentName;
         const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
 
         if (expanded) {
@@ -149,9 +120,6 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let userTookOver = false;
-  let agentStarted = false;
-
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
@@ -164,10 +132,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
-    // Ignore the initial task message that starts an autonomous subagent.
-    // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
   });
 
   pi.on("before_agent_start", () => {
@@ -175,49 +139,36 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
-    agentStarted = true;
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", (event) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
+    // Surface stopReason: "error" turns (auto-retry exhausted, provider
+    // overload, etc.) to the parent via the .exit sidecar so the watcher
+    // can report a clear failure with the underlying error message.
+    // The session stays open — the pane is interactive; completion happens
+    // via the subagent_done tool or the user closing the pane.
+    const errorInfo = findLatestAssistantError(messages);
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (errorInfo && sessionFile) {
+      try {
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          }),
+        );
+      } catch {
+        // Best effort — even without the sidecar, watcher's session-file
+        // fallback can still recover the errorMessage.
       }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
-      return;
     }
 
     recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
-    }
   });
 
   pi.on("turn_start", (event) => {
@@ -314,7 +265,8 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent Done",
     description:
       "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
+      "It is the only way to finish a subagent session (otherwise only closing the pane ends it). " +
+      "It closes this session and returns your results to the main session. " +
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {

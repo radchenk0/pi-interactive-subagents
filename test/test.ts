@@ -58,8 +58,6 @@ import {
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__, __herdrTest__, pollForExit } from "../pi-extension/subagents/cmux.ts";
@@ -629,14 +627,6 @@ describe("status.ts", () => {
     assert.equal(snapshot.waitingDurationText, "3m");
   });
 
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
-  });
-
   it("detects stalled transitions and recovery", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -883,303 +873,27 @@ describe("status.ts", () => {
   });
 });
 
-describe("subagent discovery", () => {
+describe("subagent launch params", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  it("loads session-mode from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "lineage-mode-test-agent",
-        [
-          "name: lineage-mode-test-agent",
-          "model: anthropic/test-lineage",
-          "session-mode: lineage-only",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, "lineage-only");
-    });
+  it("resolveEffectiveInteractive: explicit param wins, default autonomous", () => {
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }), false);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", interactive: true }), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T", interactive: false }), false);
   });
 
-  it("loads explicit interactive flag from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-true-test-agent",
-        [
-          "name: interactive-true-test-agent",
-          "model: anthropic/test-interactive-true",
-          "interactive: true",
-        ].join("\n"),
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-false-test-agent",
-        [
-          "name: interactive-false-test-agent",
-          "model: anthropic/test-interactive-false",
-          "interactive: false",
-        ].join("\n"),
-      );
+  it("resolves launch behavior: standalone by default, fork via param", () => {
+    const standalone = testApi.resolveLaunchBehavior({ name: "A", task: "T" });
+    assert.equal(standalone.sessionMode, "standalone");
+    assert.equal(standalone.seededSessionMode, null);
+    assert.equal(standalone.inheritsConversationContext, false);
+    assert.equal(standalone.taskDelivery, "artifact");
 
-      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
-      assert.equal(loadedTrue?.interactive, true);
-
-      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
-      assert.equal(loadedFalse?.interactive, false);
-    });
-  });
-
-  it("leaves interactive undefined when not set in frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-unset-test-agent",
-        [
-          "name: interactive-unset-test-agent",
-          "model: anthropic/test-interactive-unset",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
-      assert.equal(loaded?.interactive, undefined);
-    });
-  });
-
-  it("resolves agent `extends` — derived overrides base, base body is prepended", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
-      // Base (abstract) in the global dir, derived in the project dir —
-      // also proves extends resolves across the search-path boundaries.
-      writeAgentFile(
-        globalAgentsDir,
-        "test-base-worker",
-        [
-          "name: test-base-worker",
-          "model: anthropic/base-model",
-          "thinking: high",
-          "auto-exit: true",
-        ].join("\n"),
-        "BASE ROLE: execute with care.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "test-pi-worker",
-        [
-          "name: test-pi-worker",
-          "extends: test-base-worker",
-          "model: vllm/derived-model",
-        ].join("\n"),
-        "DERIVED: pi-specific notes.",
-      );
-
-      const derived = testApi.loadAgentDefaults("test-pi-worker");
-      assert.ok(derived);
-      // Derived overrides win
-      assert.equal(derived.name, "test-pi-worker");
-      assert.equal(derived.model, "vllm/derived-model");
-      // Unset fields inherit from the base
-      assert.equal(derived.thinking, "high");
-      assert.equal(derived.autoExit, true);
-      // Body = base role + implementation notes
-      assert.ok(derived.body!.startsWith("BASE ROLE: execute with care."));
-      assert.ok(derived.body!.includes("## Implementation Notes"));
-      assert.ok(derived.body!.includes("DERIVED: pi-specific notes."));
-    });
-  });
-
-  it("resolves agent `extends` with unknown base to the derived definition only", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "test-orphan-derived",
-        [
-          "name: test-orphan-derived",
-          "extends: does-not-exist",
-          "model: vllm/orphan",
-        ].join("\n"),
-        "ORPHAN BODY.",
-      );
-
-      const derived = testApi.loadAgentDefaults("test-orphan-derived");
-      assert.ok(derived);
-      assert.equal(derived.model, "vllm/orphan");
-      assert.equal(derived.body, "ORPHAN BODY.");
-    });
-  });
-
-  it("survives an `extends` cycle without hanging", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "test-cycle-a",
-        ["name: test-cycle-a", "extends: test-cycle-b", "model: vllm/a"].join("\n"),
-        "A BODY.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "test-cycle-b",
-        ["name: test-cycle-b", "extends: test-cycle-a", "model: vllm/b"].join("\n"),
-        "B BODY.",
-      );
-
-      const a = testApi.loadAgentDefaults("test-cycle-a");
-      assert.ok(a);
-      assert.equal(a.model, "vllm/a");
-      assert.ok(a.body!.includes("A BODY."));
-    });
-  });
-
-  it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
-    // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
-      false,
-    );
-    // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
-      true,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
-      true,
-    );
-    // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
-      true,
-    );
-  });
-
-  it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
-    // Autonomous agent that still wants to be treated as interactive.
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { autoExit: true, interactive: true },
-      ),
-      true,
-    );
-    // Non-auto-exit agent that opts back into stall pings.
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T" },
-        { interactive: false },
-      ),
-      false,
-    );
-  });
-
-  it("resolveEffectiveInteractive honors the explicit tool parameter over all else", () => {
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T", interactive: false },
-        { autoExit: false, interactive: true },
-      ),
-      false,
-    );
-    assert.equal(
-      testApi.resolveEffectiveInteractive(
-        { name: "A", task: "T", interactive: true },
-        { autoExit: true, interactive: false },
-      ),
-      true,
-    );
-  });
-
-  it("bundled concrete worker/reviewer/tester/researcher agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["pi-worker", "reviewer", "tester", "researcher"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
-      );
-    }
-
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
-  });
-
-  it("ignores invalid session-mode values", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "invalid-mode-test-agent",
-        [
-          "name: invalid-mode-test-agent",
-          "model: anthropic/test-invalid",
-          "session-mode: sideways",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, undefined);
-    });
-  });
-
-  it("resolves session mode with fork override precedence", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
-    assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
-      "lineage-only",
-    );
-    assert.equal(
-      testApi.resolveEffectiveSessionMode(
-        { name: "A", task: "T", fork: true },
-        { sessionMode: "lineage-only" },
-      ),
-      "fork",
-    );
-  });
-
-  it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
-    assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
-      sessionMode: "standalone",
-      seededSessionMode: null,
-      inheritsConversationContext: false,
-      taskDelivery: "artifact",
-    });
-    assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
-      {
-        sessionMode: "lineage-only",
-        seededSessionMode: "lineage-only",
-        inheritsConversationContext: false,
-        taskDelivery: "artifact",
-      },
-    );
-    assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
-      {
-        sessionMode: "fork",
-        seededSessionMode: "fork",
-        inheritsConversationContext: true,
-        taskDelivery: "direct",
-      },
-    );
-    assert.deepEqual(
-      testApi.resolveLaunchBehavior(
-        { name: "A", task: "T", fork: true },
-        { sessionMode: "lineage-only" },
-      ),
-      {
-        sessionMode: "fork",
-        seededSessionMode: "fork",
-        inheritsConversationContext: true,
-        taskDelivery: "direct",
-      },
-    );
+    const fork = testApi.resolveLaunchBehavior({ name: "A", task: "T", fork: true });
+    assert.equal(fork.sessionMode, "fork");
+    assert.equal(fork.seededSessionMode, "fork");
+    assert.equal(fork.inheritsConversationContext, true);
+    assert.equal(fork.taskDelivery, "direct");
   });
 
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
@@ -1214,147 +928,9 @@ describe("subagent discovery", () => {
       ["/skill:review", "do the task"],
     );
   });
-
-  it("lists visible agents from discovery", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "visible-discovery-test-agent",
-        [
-          "name: visible-discovery-test-agent",
-          "description: Visible test agent",
-          "model: anthropic/test-visible",
-        ].join("\n"),
-      );
-
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
-
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
-      assert.match(result.content[0].text, /visible-discovery-test-agent/);
-    });
-  });
-
-  it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "hidden-discovery-test-agent",
-        [
-          "name: hidden-discovery-test-agent",
-          "description: Hidden test agent",
-          "model: anthropic/test-hidden",
-          "disable-model-invocation: true",
-        ].join("\n"),
-        "You are the hidden agent.",
-      );
-
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
-
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
-
-      const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
-      assert.ok(loaded, "expected hidden agent to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-hidden");
-      assert.equal(loaded.body, "You are the hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
-    });
-  });
-
-  it("lets a hidden project agent shadow a visible global agent", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Global visible agent",
-          "model: anthropic/test-global",
-        ].join("\n"),
-        "You are the global visible agent.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Project hidden agent",
-          "model: anthropic/test-project",
-          "disable-model-invocation: true",
-        ].join("\n"),
-        "You are the project hidden agent.",
-      );
-
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
-
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
-
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
-
-      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
-      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
-
-      const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
-      assert.ok(loaded, "expected project override to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
-    });
-  });
 });
+
 describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
-  describe("shouldAutoExitOnAgentEnd", () => {
-    it("auto-exits after normal completion when there was no takeover", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-
-    it("auto-exits after normal completion even when the user sent the prompt", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
-    });
-
-    it("stays open after Escape aborts the run", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
-    });
-
-    it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-  });
-
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
@@ -1568,28 +1144,6 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
-  it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
-    const testApi = (subagentsModule as any).__test__;
-
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
-      autoExit: true,
-      interactive: false,
-    });
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
-      autoExit: false,
-      interactive: true,
-    });
-  });
-
-  it("expands spawning false to deny subagent interruption", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const denied = testApi.resolveDenyTools({ spawning: false });
-
-    assert.equal(denied.has("subagent"), true);
-    assert.equal(denied.has("subagent_interrupt"), true);
-    assert.equal(denied.has("subagent_resume"), true);
-  });
-
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -1611,16 +1165,22 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_resume with an interactive override", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
     const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
     assert.ok(resumeTool, "expected subagent_resume tool to be registered");
 
-    const autoExitSchema = resumeTool.parameters.properties.autoExit;
-    assert.equal(autoExitSchema.type, "boolean");
-    assert.match(autoExitSchema.description, /Defaults to true/);
+    const interactiveSchema = resumeTool.parameters.properties.interactive;
+    assert.equal(interactiveSchema.type, "boolean");
+    assert.match(interactiveSchema.description, /Defaults to false/);
+
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+    assert.equal(subagentTool.parameters.properties.agent, undefined, "agent param removed");
+    assert.equal(subagentTool.parameters.properties.cli, undefined, "cli param removed");
+    assert.ok(subagentTool.parameters.properties.thinking, "thinking param present");
   });
 });
 
@@ -2024,31 +1584,6 @@ describe("subagent interruption", () => {
 
       assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
       assert.equal(runningMap.has("a1"), true);
-    } finally {
-      runningMap.clear();
-    }
-  });
-
-  it("rejects Claude-backed interrupt requests before delivery", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    let delivered = false;
-    runningMap.clear();
-
-    try {
-      runningMap.set("a1", makeRunning({ cli: "claude" }));
-
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        delivered = true;
-      });
-
-      assert.equal(delivered, false);
-      assert.match(result.content[0].text, /currently supported only for Pi-backed subagents/i);
-      assert.deepEqual(result.details, {
-        error: "claude interrupt unsupported",
-        id: "a1",
-        name: "Worker",
-      });
     } finally {
       runningMap.clear();
     }
@@ -3198,114 +2733,6 @@ describe("pollForExit terminal detection", () => {
   it("isSurfaceAlive reports false for a missing herdr pane", () => {
     if (getMuxBackend() !== "herdr") return;
     assert.equal(isSurfaceAlive("w9:p999"), false);
-  });
-});
-
-describe("agent frontmatter env interpolation", () => {
-  const { interpolateEnvVars, loadDotEnvFile, parseAgentDefinition } =
-    (subagentsModule as any).__test__;
-  const saved: Record<string, string | undefined> = {};
-  const vars = ["PI_SUBAGENT_MODEL", "PI_SUBAGENT_MODEL_PLANNER", "MY_TEST_VAR"];
-  const cleanup = () => {
-    for (const k of vars) delete process.env[k];
-  };
-
-  it("substitutes ${VAR} from the environment", () => {
-    process.env.MY_TEST_VAR = "acme/test-model-1";
-    try {
-      assert.equal(interpolateEnvVars("${MY_TEST_VAR}"), "acme/test-model-1");
-    } finally {
-      cleanup();
-    }
-  });
-
-  it("falls back to the default when the variable is unset", () => {
-    cleanup();
-    assert.equal(
-      interpolateEnvVars("${PI_SUBAGENT_MODEL:-acme/fallback-model}"),
-      "acme/fallback-model",
-    );
-  });
-
-  it("resolves nested defaults left to right", () => {
-    cleanup();
-    assert.equal(
-      interpolateEnvVars(
-        "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
-      ),
-      "acme/fallback-model",
-    );
-    process.env.PI_SUBAGENT_MODEL = "acme/mid-model";
-    try {
-      assert.equal(
-        interpolateEnvVars(
-          "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
-        ),
-        "acme/mid-model",
-      );
-      process.env.PI_SUBAGENT_MODEL_PLANNER = "acme/agent-model";
-      assert.equal(
-        interpolateEnvVars(
-          "${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
-        ),
-        "acme/agent-model",
-      );
-    } finally {
-      cleanup();
-    }
-  });
-
-  it("leaves plain values untouched", () => {
-    assert.equal(interpolateEnvVars("plain-model"), "plain-model");
-    assert.equal(interpolateEnvVars("acme/fallback-model"), "acme/fallback-model");
-  });
-
-  it("parses .env files without overriding the real environment", () => {
-    const env: NodeJS.ProcessEnv = {};
-    env.EXISTING = "real";
-    const file = `${tmpdir()}/pi-subagents-env-test-${Date.now()}.env`;
-    writeFileSync(
-      file,
-      [
-        "# comment",
-        "",
-        "PI_SUBAGENT_MODEL=acme/fallback-model",
-        'QUOTED="hello world"',
-        "EXISTING=from-file",
-        "BROKEN LINE",
-        "=novalue",
-        "PI_SUBAGENT_MODEL_PLANNER=acme/agent-model",
-      ].join("\n"),
-    );
-    try {
-      loadDotEnvFile(file, env);
-      assert.equal(env.PI_SUBAGENT_MODEL, "acme/fallback-model");
-      assert.equal(env.QUOTED, "hello world");
-      assert.equal(env.EXISTING, "real"); // real env wins
-      assert.equal(env.PI_SUBAGENT_MODEL_PLANNER, "acme/agent-model");
-    } finally {
-      unlinkSync(file);
-    }
-  });
-
-  it("resolves models from env in parseAgentDefinition", () => {
-    cleanup();
-    process.env.PI_SUBAGENT_MODEL = "acme/test-model-2";
-    try {
-      const def = parseAgentDefinition(
-        [
-          "---",
-          "name: test-agent",
-          "model: ${PI_SUBAGENT_MODEL_PLANNER:-${PI_SUBAGENT_MODEL:-acme/fallback-model}}",
-          "---",
-          "body text",
-        ].join("\n"),
-        "fallback",
-      );
-      assert.equal(def?.model, "acme/test-model-2");
-    } finally {
-      cleanup();
-    }
   });
 });
 

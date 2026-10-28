@@ -1681,7 +1681,7 @@ export interface PollResult {
   exitCode: number;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
-  /** Question data if reason is "question" (exit-based escalation, e.g. claude workers) */
+  /** Question data if reason is "question" (exit-based escalation) */
   question?: { qid: string; question: string; options?: QuestionOption[]; multiSelect?: boolean };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
@@ -1739,7 +1739,6 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
-    sentinelFile?: string;
     onTick?: (elapsed: number) => void;
     /**
      * Optional native slow path (herdr `pane wait-output`): server-side
@@ -1814,15 +1813,6 @@ export async function pollForExit(
           if (data && data.phase === "done") {
             return { reason: "done", exitCode: 0 };
           }
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }

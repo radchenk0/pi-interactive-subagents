@@ -1,5 +1,5 @@
 #!/bin/sh
-# pi-escalate — exit-based question escalation for claude-CLI subagents.
+# pi-escalate — exit-based question escalation for subagents.
 #
 # Usage:
 #   pi-escalate "question" ["json-options-array"]

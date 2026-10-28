@@ -899,6 +899,23 @@ describe("subagent launch params", () => {
     }
   });
 
+  it("resolveEffectiveThinking: param wins, PI_SUBAGENT_THINKING fallback, medium default", () => {
+    const prev = process.env.PI_SUBAGENT_THINKING;
+    try {
+      process.env.PI_SUBAGENT_THINKING = "high";
+      assert.equal(testApi.resolveEffectiveThinking("low"), "low");
+      assert.equal(testApi.resolveEffectiveThinking(undefined), "high");
+      assert.equal(testApi.resolveEffectiveThinking(""), "high");
+
+      delete process.env.PI_SUBAGENT_THINKING;
+      assert.equal(testApi.resolveEffectiveThinking(undefined), "medium");
+      assert.equal(testApi.resolveEffectiveThinking("xhigh"), "xhigh");
+    } finally {
+      if (prev === undefined) delete process.env.PI_SUBAGENT_THINKING;
+      else process.env.PI_SUBAGENT_THINKING = prev;
+    }
+  });
+
   describe("resolveSpawnAllowed", () => {
     const prevId = process.env.PI_SUBAGENT_ID;
     const prevFlag = process.env.PI_SUBAGENT_ALLOW_SPAWNING;

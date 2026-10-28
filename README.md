@@ -215,7 +215,7 @@ subagent({ name: "Game Designer", cwd: "agents/game-designer", task: "Design the
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `systemPrompt`         | string  | —              | Appended to the child's system prompt (identity/role)                                             |
 | `model`                | string  | `PI_SUBAGENT_MODEL` | Model pin (`provider/model`). Fallback order: param → `PI_SUBAGENT_MODEL` env var → the child's own default model |
-| `thinking`             | string  | —              | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`                         |
+| `thinking`             | string  | `medium`       | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Fallback order: param → `PI_SUBAGENT_THINKING` env var → `medium` |
 | `skills`               | string  | —              | Comma-separated skill names to invoke in the child                                                |
 | `tools`                | string  | —              | Comma-separated ALLOWLIST that narrows the child's tool surface (see below). Subagent control tools (`subagent_done`, `ask_parent`, `reply_to_parent`, `caller_ping`) are always included and cannot be removed. | 
 | `cwd`                  | string  | —              | Working directory for the sub-agent (absolute, or relative to the parent's cwd)                   |

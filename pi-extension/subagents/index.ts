@@ -149,7 +149,8 @@ const SubagentParams = Type.Object({
   ),
   thinking: Type.Optional(
     Type.String({
-      description: "Thinking level: off, minimal, low, medium, high, xhigh, max",
+      description:
+        "Thinking level: off, minimal, low, medium, high, xhigh, max. Falls back to the PI_SUBAGENT_THINKING env var, then to 'medium'.",
     }),
   ),
   skills: Type.Optional(
@@ -214,6 +215,14 @@ const SPAWNING_TOOLS = new Set([
 export function resolveSpawnAllowed(): boolean {
   if (!process.env.PI_SUBAGENT_ID) return true;
   return process.env.PI_SUBAGENT_ALLOW_SPAWNING === "1";
+}
+
+/**
+ * Thinking level resolution: explicit param → PI_SUBAGENT_THINKING env var
+ * → "medium" default.
+ */
+export function resolveEffectiveThinking(paramThinking?: string): string {
+  return paramThinking || process.env.PI_SUBAGENT_THINKING || "medium";
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -905,6 +914,7 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   resolveEffectiveModel,
+  resolveEffectiveThinking,
   resolveSpawnAllowed,
   SPAWNING_TOOLS,
   buildSubagentToolAllowlist,
@@ -949,7 +959,7 @@ async function launchSubagent(
   const effectiveModel = resolveEffectiveModel(params.model);
   const effectiveTools = params.tools;
   const effectiveSkills = params.skills;
-  const effectiveThinking = params.thinking;
+  const effectiveThinking = resolveEffectiveThinking(params.thinking);
   const effectiveInteractive = resolveEffectiveInteractive(params);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1359,7 +1369,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Recursion is OFF by default: a sub-agent cannot spawn further sub-agents unless you pass spawning: true. " +
         "\n\nPARAMETERS — " +
         "Required: name, task (make the task self-contained: the sub-agent does not see your conversation unless fork: true). " +
-        "Optional: model ('provider/id'; falls back to PI_SUBAGENT_MODEL, then the child's default), thinking (off…max), systemPrompt (role instructions), skills, tools (allowlist), cwd (local .pi config / AGENTS.md / skills), fork (inherit this conversation), interactive (long-running, user-driven pane; parent not woken on stalls), spawning (grant further delegation), resumeSessionId. " +
+        "Optional: model ('provider/id'; falls back to PI_SUBAGENT_MODEL, then the child's default), thinking (off…max; default medium), systemPrompt (role instructions), skills, tools (allowlist), cwd (local .pi config / AGENTS.md / skills), fork (inherit this conversation), interactive (long-running, user-driven pane; parent not woken on stalls), spawning (grant further delegation), resumeSessionId. " +
         "\n\nCONTROLLING A RUNNING SUB-AGENT — " +
         "On a FAILED or cancelled steer, inspect the pane with subagent_resume (pass the session path) BEFORE judging the outcome; you can resume with fix instructions. " +
         "ask_subagent asks a running sub-agent a multiple-choice question; answer_subagent delivers the answer to one that is parked waiting; subagent_interrupt sends Esc; subagent_kill terminates.",

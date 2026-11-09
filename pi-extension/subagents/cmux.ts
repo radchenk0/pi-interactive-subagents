@@ -8,7 +8,7 @@ import type { QuestionOption, QuestionPayload } from "./question-channel.ts";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "herdr" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "herdr" | "herdrapp" | "tmux" | "zellij" | "wezterm";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -48,6 +48,7 @@ function muxPreference(): MuxBackend | null {
   if (
     pref === "cmux" ||
     pref === "herdr" ||
+    pref === "herdrapp" ||
     pref === "tmux" ||
     pref === "zellij" ||
     pref === "wezterm"
@@ -93,6 +94,46 @@ export const __herdrTest__ = {
   },
 };
 
+let herdrAppRuntimeAvailable: boolean | null = null;
+
+/**
+ * herdr-app generation (herdr-core) availability = the `HC_TERMINAL_ID` env
+ * var that herdr-core injects into every terminal it hosts AND a healthy
+ * `hc ls --json` (core reachable, parseable `{terminals: [...]}` envelope).
+ * Env presence is far more reliable than probing for a binary. Result is
+ * cached for the process lifetime; __herdrAppTest__ overrides it in tests.
+ */
+function isHerdrAppRuntimeAvailable(): boolean {
+  if (herdrAppRuntimeAvailable === null) {
+    if (!process.env.HC_TERMINAL_ID) {
+      herdrAppRuntimeAvailable = false;
+    } else if (!hasCommand("hc")) {
+      herdrAppRuntimeAvailable = false;
+    } else {
+      try {
+        const out = execFileSync("hc", ["ls", "--json"], {
+          encoding: "utf8",
+          timeout: 5000,
+        }).trim();
+        const parsed = JSON.parse(out);
+        herdrAppRuntimeAvailable =
+          !!parsed && typeof parsed === "object" && Array.isArray((parsed as { terminals?: unknown }).terminals);
+      } catch {
+        herdrAppRuntimeAvailable = false;
+      }
+    }
+  }
+  return herdrAppRuntimeAvailable;
+}
+
+/** One-line warning, at most once per key (mirrors herdr-native's warn()). */
+const herdrAppWarnings = new Set<string>();
+function herdrAppWarnOnce(key: string, message: string): void {
+  if (herdrAppWarnings.has(key)) return;
+  herdrAppWarnings.add(key);
+  console.warn(`[subagents] herdrapp: ${message}`);
+}
+
 function isTmuxRuntimeAvailable(): boolean {
   return !!process.env.TMUX && hasCommand("tmux");
 }
@@ -113,6 +154,10 @@ export function isHerdrAvailable(): boolean {
   return isHerdrRuntimeAvailable();
 }
 
+export function isHerdrAppAvailable(): boolean {
+  return isHerdrAppRuntimeAvailable();
+}
+
 export function isTmuxAvailable(): boolean {
   return isTmuxRuntimeAvailable();
 }
@@ -129,14 +174,19 @@ export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
+  if (pref === "herdrapp") return isHerdrAppRuntimeAvailable() ? "herdrapp" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
 
-  // herdr must be detected BEFORE tmux: older herdr releases ran on top of
-  // tmux (TMUX env is set inside herdr), so a tmux-first check would pick the
-  // wrong backend. herdr 0.8.x is standalone, but the ordering stays for
-  // compatibility with those versions. (spec D10)
+  // herdrapp (herdr-app generation) first: herdr-core sets HC_TERMINAL_ID in
+  // every terminal it hosts and no other backend's env is set there — env
+  // presence plus a healthy `hc ls` is the most reliable signal we have.
+  if (isHerdrAppRuntimeAvailable()) return "herdrapp";
+  // cmux stays before herdr, and herdr must be detected BEFORE tmux: older
+  // herdr releases ran on top of tmux (TMUX env is set inside herdr), so a
+  // tmux-first check would pick the wrong backend. herdr 0.8.x is standalone,
+  // but the ordering stays for compatibility with those versions. (spec D10)
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isHerdrRuntimeAvailable()) return "herdr";
   if (isTmuxRuntimeAvailable()) return "tmux";
@@ -156,6 +206,9 @@ export function muxSetupHint(): string {
   }
   if (pref === "herdr") {
     return "Start pi inside herdr (`herdr`, then run `pi`).";
+  }
+  if (pref === "herdrapp") {
+    return "Start pi inside a Herdr (herdr-app) terminal.";
   }
   if (pref === "tmux") {
     return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
@@ -861,6 +914,149 @@ function herdrExec(args: string[]): string {
   return result.stdout;
 }
 
+// ── herdr-app generation (herdr-core: `hc` + `herdr-app`) ─────────────
+//
+// Surface identity is the hc terminal address (e.g. `t9`). `hc` errors come
+// back as `{"error": {...}}` JSON with a non-zero exit; `herdr-app do`
+// prints the created resources as JSON (e.g. `{"pane": ..., "terminal": ...}`)
+// or `{"error": "..."}` and exits 1 on failure.
+
+type HerdrAppCliResult = { code: number; stdout: string; stderr: string };
+type HerdrAppCliRunner = (command: "hc" | "herdr-app", args: string[]) => HerdrAppCliResult;
+
+let herdrAppCliRunner: HerdrAppCliRunner | null = null;
+
+function herdrAppCli(command: "hc" | "herdr-app", args: string[], timeoutMs = 10000): HerdrAppCliResult {
+  if (herdrAppCliRunner) return herdrAppCliRunner(command, args);
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: timeoutMs });
+  if (result.error) {
+    return { code: 1, stdout: "", stderr: String((result.error as Error).message) };
+  }
+  return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/** Best-effort: extract the CLI's own error message from stdout/stderr. */
+function herdrAppErrorDetail(r: HerdrAppCliResult): string {
+  for (const text of [r.stdout, r.stderr]) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    try {
+      const err = (JSON.parse(trimmed) as { error?: unknown }).error;
+      if (typeof err === "string" && err) return err;
+      if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+        return (err as { message: string }).message;
+      }
+    } catch {
+      // Not JSON — fall through to the raw text.
+    }
+    return trimmed.split("\n").pop() ?? trimmed;
+  }
+  return `exit ${r.code}`;
+}
+
+function herdrAppParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text.trim());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run `hc <args>` and return raw stdout (plain text for `read`). Throws on
+ * non-zero exit or spawn failure with the CLI's own error message.
+ */
+function hcExec(args: string[], timeoutMs?: number): string {
+  const r = herdrAppCli("hc", args, timeoutMs);
+  if (r.code !== 0) {
+    throw new Error(`hc ${args.join(" ")} failed: ${herdrAppErrorDetail(r)}`);
+  }
+  return r.stdout;
+}
+
+/**
+ * Run `herdr-app do <command> ...` and return the created-resources payload.
+ * Throws with the CLI's error message on failure.
+ */
+function herdrAppDo(args: string[], timeoutMs?: number): Record<string, unknown> {
+  const r = herdrAppCli("herdr-app", ["do", ...args], timeoutMs);
+  if (r.code !== 0) {
+    throw new Error(`herdr-app do ${args.join(" ")} failed: ${herdrAppErrorDetail(r)}`);
+  }
+  const parsed = herdrAppParseJson(r.stdout);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Unexpected herdr-app do output: ${r.stdout.trim().slice(0, 200) || "(empty)"}`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Lazy pane ↔ terminal map for the herdr-app generation, built once from
+ * `herdr-app ls` (spaces → tabs → panes, each pane carrying its terminal
+ * address). Pane ids are stable for a terminal's lifetime, so a single
+ * snapshot is enough. Returns null when unknown (caller falls back to the
+ * app's focus target).
+ */
+let herdrAppPaneMap: Map<string, string> | null = null;
+
+function herdrAppPaneForTerminal(terminal: string | undefined): string | null {
+  if (!terminal) return null;
+  if (!herdrAppPaneMap) {
+    herdrAppPaneMap = new Map();
+    try {
+      const r = herdrAppCli("herdr-app", ["ls"], 5000);
+      if (r.code === 0) {
+        const parsed = herdrAppParseJson(r.stdout) as
+          | { spaces?: { tabs?: { terminals?: { terminal?: unknown; pane?: unknown }[] }[] }[] }
+          | null;
+        for (const space of parsed?.spaces ?? []) {
+          for (const tab of space?.tabs ?? []) {
+            for (const term of tab?.terminals ?? []) {
+              if (typeof term?.terminal === "string" && typeof term?.pane === "string") {
+                herdrAppPaneMap.set(term.terminal, term.pane);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Map stays empty — callers fall back to the app's focus target.
+    }
+  }
+  return herdrAppPaneMap.get(terminal) ?? null;
+}
+
+/**
+ * Query a terminal's lifecycle state via `hc get <t> --json`.
+ * `gone` = the core has no such terminal; `unknown` = transient error.
+ */
+function herdrAppTerminalState(terminal: string): "live" | "finished" | "gone" | "unknown" {
+  const r = herdrAppCli("hc", ["get", terminal, "--json"], 5000);
+  if (r.code === 0) {
+    const parsed = herdrAppParseJson(r.stdout) as { state?: unknown } | null;
+    if (parsed?.state === "live") return "live";
+    if (parsed?.state === "finished") return "finished";
+    return "unknown";
+  }
+  return /not_found|no terminal/i.test(`${r.stdout} ${r.stderr}`) ? "gone" : "unknown";
+}
+
+export const __herdrAppTest__ = {
+  /** Force (or reset with null) the cached herdrapp availability result. */
+  setRuntimeAvailableForTest(value: boolean | null): void {
+    herdrAppRuntimeAvailable = value;
+  },
+  /** Inject a fake CLI runner (tests). Pass null to restore. */
+  setRunner(runner: HerdrAppCliRunner | null): void {
+    herdrAppCliRunner = runner;
+  },
+  /** Reset the cached pane↔terminal map and deduped warnings (tests). */
+  resetState(): void {
+    herdrAppPaneMap = null;
+    herdrAppWarnings.clear();
+  },
+};
+
 /**
  * herdr 0.8.x layout API.
  *
@@ -1095,6 +1291,10 @@ export function createSurface(name: string): string {
     return createSurfaceSplit(name, "right", herdrCurrentPane().paneId);
   }
 
+  if (backend === "herdrapp") {
+    return createSurfaceSplit(name, "right");
+  }
+
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
   // See https://github.com/HazAT/pi-interactive-subagents/issues/12
   const fromSurface = backend === "tmux" ? process.env.TMUX_PANE : undefined;
@@ -1141,6 +1341,34 @@ export function createSurfaceSplit(
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
+  }
+
+  if (backend === "herdrapp") {
+    // `pane.split` (no argv) opens a new pane with the machine's default
+    // shell in our tab; the subagent's launch command is typed in later via
+    // `hc send`, so the pane starts plain. Targeting our own pane (from the
+    // herdr-app ls map) keeps the split beside pi regardless of keyboard
+    // focus; without it the app's focused pane is split instead. The new
+    // terminal's address (t9) is the subagent's surface id.
+    const terminal = process.env.HC_TERMINAL_ID;
+    const args: string[] = ["pane.split", "--direction", herdrSplitDirection(direction)];
+    const pane = herdrAppPaneForTerminal(terminal);
+    if (pane) args.push("--pane", pane);
+    const created = herdrAppDo(args) as { pane?: unknown; terminal?: unknown };
+    const newTerminal = typeof created.terminal === "string" ? created.terminal : null;
+    if (!newTerminal) {
+      throw new Error(`Unexpected herdr-app pane.split output: ${JSON.stringify(created)}`);
+    }
+    // pane.split takes keyboard focus — hand it back to the pi terminal
+    // (best effort, cosmetic; `hc send` delivery is focus-independent).
+    if (terminal) {
+      try {
+        herdrAppDo(["pane.focus", "--terminal", terminal]);
+      } catch {
+        // Focus restore is cosmetic only — never fail the spawn.
+      }
+    }
+    return newTerminal;
   }
 
   if (backend === "herdr") {
@@ -1261,6 +1489,13 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "herdrapp") {
+    // No per-pane rename in the herdr-app generation (tabs are named,
+    // panes track their program). Cosmetic only — a no-op, one warning max.
+    herdrAppWarnOnce("rename-current-tab", "pane rename is not supported by the herdr-app generation; skipping");
+    return;
+  }
+
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
@@ -1315,6 +1550,12 @@ export function renameWorkspace(title: string): void {
       throw new Error("herdr pane current: missing workspace_id");
     }
     herdrCli(["workspace", "rename", workspaceId, title]);
+    return;
+  }
+
+  if (backend === "herdrapp") {
+    // The parent pi owns its space name; renaming it for a subagent would
+    // clobber the user's workspace. Cosmetic only — a no-op.
     return;
   }
 
@@ -1377,6 +1618,13 @@ export function sendCommand(surface: string, command: string): void {
     return;
   }
 
+  if (backend === "herdrapp") {
+    // `hc send` pastes the command and presses Enter; it waits for the
+    // pane's program to accept input, so no shell-ready delay is needed.
+    hcExec(["send", surface, command], 30000);
+    return;
+  }
+
   if (backend === "cmux") {
     execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
       encoding: "utf8",
@@ -1411,6 +1659,13 @@ export function sendEscape(surface: string): void {
 
   if (backend === "herdr") {
     herdrCli(["pane", "send-keys", surface, "esc"]);
+    return;
+  }
+
+  if (backend === "herdrapp") {
+    // `hc keys <t> esc` sends only the Escape key (verified live: unlike
+    // `hc send`, it does not append an Enter).
+    hcExec(["keys", surface, "esc"]);
     return;
   }
 
@@ -1478,6 +1733,12 @@ export function sendLongCommand(
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
 
+  if (backend === "herdrapp") {
+    // `hc read` prints the plain screen text even when piped (verified
+    // live), so sentinel/marker regexes match directly.
+    return hcExec(["read", surface, "--lines", String(Math.max(1, lines))]);
+  }
+
   if (backend === "herdr") {
     // `pane read --source recent-unwrapped --format text` emits clean plain text
     // with long lines unwrapped (verified live, spec A1) — long strings aren't
@@ -1537,6 +1798,12 @@ export function readScreen(surface: string, lines = 50): string {
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
+
+  if (backend === "herdrapp") {
+    // `hc read` prints the plain screen text even when piped (verified live).
+    // Runs through the shared runner so tests can mock it like the sync path.
+    return hcExec(["read", surface, "--lines", String(Math.max(1, lines))]);
+  }
 
   if (backend === "herdr") {
     // `pane read --source recent-unwrapped --format text` emits clean plain text
@@ -1608,6 +1875,19 @@ export function isSurfaceAlive(surface: string): boolean | null {
     return null;
   }
 
+  if (backend === "herdrapp") {
+    switch (herdrAppTerminalState(surface)) {
+      case "live":
+        return true;
+      case "finished":
+        return false;
+      case "gone":
+        return false;
+      default:
+        return null;
+    }
+  }
+
   if (backend === "herdr") {
     try {
       herdrCli(["pane", "get", surface]);
@@ -1649,6 +1929,17 @@ export function closeSurface(surface: string): void {
 
   if (backend === "herdr") {
     herdrCli(["pane", "close", surface]);
+    return;
+  }
+
+  if (backend === "herdrapp") {
+    // `hc kill` ends the terminal's whole process tree (verified live) and
+    // the app drops the pane from the tab automatically. A terminal that
+    // already exited is a no-op, not an error.
+    const r = herdrAppCli("hc", ["kill", surface]);
+    if (r.code !== 0 && !/not_found|no terminal/i.test(`${r.stdout} ${r.stderr}`)) {
+      throw new Error(`hc kill ${surface} failed: ${herdrAppErrorDetail(r)}`);
+    }
     return;
   }
 

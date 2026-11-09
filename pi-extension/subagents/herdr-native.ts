@@ -65,8 +65,12 @@ function warn(key: string, message: string): void {
 }
 
 /**
- * Enabled by default on the herdr backend. Opt out with
- * PI_SUBAGENT_HERDR_NATIVE=0. (Explicit "1" is accepted for compatibility.)
+ * Enabled by default on the herdr backend (the old standalone `herdr` CLI).
+ * Opt out with PI_SUBAGENT_HERDR_NATIVE=0. (Explicit "1" is accepted for
+ * compatibility.) The check is `=== "herdr"` on purpose: the herdr-app
+ * generation backend (`herdrapp`) has none of these server-side agent APIs,
+ * so it resolves to disabled here and zero native calls go out — the raw
+ * `hc` pane path in cmux.ts handles it instead.
  */
 export function herdrNativeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   if ((env.PI_SUBAGENT_HERDR_NATIVE ?? "").trim() === "0") return false;

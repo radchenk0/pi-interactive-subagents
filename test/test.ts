@@ -38,6 +38,13 @@ import {
   parseHerdrResult,
   balanceLayoutRatios,
   collectLayoutPaneIds,
+  createSurfaceSplit,
+  createSurface,
+  sendCommand,
+  sendEscape,
+  readScreen,
+  closeSurface,
+  isHerdrAppAvailable,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -60,7 +67,7 @@ import {
 import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__, __herdrTest__, pollForExit } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__, __herdrTest__, __herdrAppTest__, pollForExit } from "../pi-extension/subagents/cmux.ts";
 import {
   herdrNativeEnabled,
   sanitizeAgentName,
@@ -2543,6 +2550,260 @@ describe("cmux.ts", () => {
   });
 });
 
+describe("herdrapp backend (herdr-app generation)", () => {
+  describe("getMuxBackend (herdrapp)", () => {
+    const savedEnv = {
+      PI_SUBAGENT_MUX: process.env.PI_SUBAGENT_MUX,
+      HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+      CMUX_SOCKET_PATH: process.env.CMUX_SOCKET_PATH,
+      TMUX: process.env.TMUX,
+    };
+
+    after(() => {
+      __herdrAppTest__.setRuntimeAvailableForTest(null);
+      __herdrTest__.setRuntimeAvailableForTest(null);
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    it("selects herdrapp before tmux when both signals are present", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      process.env.HC_TERMINAL_ID = "t9";
+      process.env.TMUX = "/tmp/tmux-0/default,12345,0";
+      __herdrAppTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdrapp");
+      } finally {
+        __herdrAppTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("selects herdrapp before the old herdr probe", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      process.env.HC_TERMINAL_ID = "t9";
+      __herdrAppTest__.setRuntimeAvailableForTest(true);
+      __herdrTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdrapp");
+      } finally {
+        __herdrAppTest__.setRuntimeAvailableForTest(null);
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("falls through to the old herdr probe when herdrapp is not available", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      delete process.env.HC_TERMINAL_ID;
+      delete process.env.CMUX_SOCKET_PATH;
+      delete process.env.TMUX;
+      __herdrAppTest__.setRuntimeAvailableForTest(false);
+      __herdrTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdr");
+      } finally {
+        __herdrAppTest__.setRuntimeAvailableForTest(null);
+        __herdrTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("honors PI_SUBAGENT_MUX=herdrapp explicit preference", () => {
+      process.env.PI_SUBAGENT_MUX = "herdrapp";
+      __herdrAppTest__.setRuntimeAvailableForTest(true);
+      try {
+        assert.equal(getMuxBackend(), "herdrapp");
+      } finally {
+        __herdrAppTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("returns null for PI_SUBAGENT_MUX=herdrapp when unavailable", () => {
+      process.env.PI_SUBAGENT_MUX = "herdrapp";
+      __herdrAppTest__.setRuntimeAvailableForTest(false);
+      try {
+        assert.equal(getMuxBackend(), null);
+      } finally {
+        __herdrAppTest__.setRuntimeAvailableForTest(null);
+      }
+    });
+
+    it("is unavailable without HC_TERMINAL_ID (no CLI probe needed)", () => {
+      delete process.env.PI_SUBAGENT_MUX;
+      delete process.env.HC_TERMINAL_ID;
+      __herdrAppTest__.setRuntimeAvailableForTest(null);
+      assert.equal(isHerdrAppAvailable(), false);
+      __herdrAppTest__.setRuntimeAvailableForTest(null);
+    });
+  });
+
+  describe("CLI argv construction (mocked runner)", () => {
+    const savedEnv = {
+      PI_SUBAGENT_MUX: process.env.PI_SUBAGENT_MUX,
+      HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+    };
+    let calls: { command: string; args: string[] }[] = [];
+
+    beforeEach(() => {
+      __herdrAppTest__.resetState();
+      calls = [];
+      process.env.HC_TERMINAL_ID = "t5";
+      delete process.env.PI_SUBAGENT_MUX;
+      __herdrAppTest__.setRuntimeAvailableForTest(true);
+      __herdrAppTest__.setRunner((command, args) => {
+        calls.push({ command, args });
+        if (command === "herdr-app" && args[0] === "ls") {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              spaces: [
+                {
+                  tabs: [
+                    {
+                      terminals: [
+                        { terminal: "t5", pane: "pParent" },
+                        { terminal: "t9", pane: "pOther" },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            }),
+            stderr: "",
+          };
+        }
+        if (command === "herdr-app" && args[0] === "do") {
+          return { code: 0, stdout: JSON.stringify({ pane: "pNew", terminal: "tNew" }), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+    });
+
+    after(() => {
+      __herdrAppTest__.setRunner(null);
+      __herdrAppTest__.setRuntimeAvailableForTest(null);
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
+    it("createSurfaceSplit: pane.split targets our own pane; surface is the terminal address", () => {
+      const surface = createSurfaceSplit("Worker", "right");
+      assert.equal(surface, "tNew");
+      assert.deepEqual(
+        calls.map((c) => `${c.command} ${c.args.join(" ")}`),
+        [
+          "herdr-app ls",
+          "herdr-app do pane.split --direction right --pane pParent",
+          "herdr-app do pane.focus --terminal t5",
+        ],
+      );
+    });
+
+    it("createSurface: right split from the current terminal", () => {
+      const surface = createSurface("Worker");
+      assert.equal(surface, "tNew");
+      const split = calls.find((c) => c.command === "herdr-app" && c.args[0] === "do");
+      assert.deepEqual(split?.args, ["do", "pane.split", "--direction", "right", "--pane", "pParent"]);
+    });
+
+    it("createSurfaceSplit: down direction maps to --direction down", () => {
+      createSurfaceSplit("Worker", "down");
+      const split = calls.find((c) => c.command === "herdr-app" && c.args[0] === "do");
+      assert.deepEqual(split?.args, ["do", "pane.split", "--direction", "down", "--pane", "pParent"]);
+    });
+
+    it("createSurfaceSplit: falls back to the focus target when herdr-app ls fails", () => {
+      __herdrAppTest__.setRunner((command, args) => {
+        calls.push({ command, args });
+        if (command === "herdr-app" && args[0] === "ls") {
+          return { code: 1, stdout: "", stderr: "app not running" };
+        }
+        if (command === "herdr-app" && args[0] === "do") {
+          return { code: 0, stdout: JSON.stringify({ pane: "pNew", terminal: "tNew" }), stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      });
+      const surface = createSurfaceSplit("Worker", "right");
+      assert.equal(surface, "tNew");
+      const split = calls.find((c) => c.command === "herdr-app" && c.args[0] === "do");
+      assert.deepEqual(split?.args, ["do", "pane.split", "--direction", "right"]);
+    });
+
+    it("createSurfaceSplit: throws when pane.split reports an error", () => {
+      __herdrAppTest__.setRunner((command, args) => {
+        calls.push({ command, args });
+        if (command === "herdr-app" && args[0] === "ls") {
+          return { code: 0, stdout: JSON.stringify({ spaces: [] }), stderr: "" };
+        }
+        return { code: 1, stdout: JSON.stringify({ error: 'no pane "pX"' }), stderr: "" };
+      });
+      assert.throws(() => createSurfaceSplit("Worker", "right"), /no pane "pX"/);
+    });
+
+    it("sendCommand: hc send <t> <command>", () => {
+      sendCommand("t9", "ls -la");
+      assert.deepEqual(calls, [{ command: "hc", args: ["send", "t9", "ls -la"] }]);
+    });
+
+    it("sendEscape: hc keys <t> esc", () => {
+      sendEscape("t9");
+      assert.deepEqual(calls, [{ command: "hc", args: ["keys", "t9", "esc"] }]);
+    });
+
+    it("readScreen: hc read <t> --lines N, returns the plain screen text", () => {
+      __herdrAppTest__.setRunner((command, args) => {
+        calls.push({ command, args });
+        return { code: 0, stdout: "line1\n__SUBAGENT_DONE_0__\n", stderr: "" };
+      });
+      const screen = readScreen("t9", 5);
+      assert.equal(screen, "line1\n__SUBAGENT_DONE_0__\n");
+      assert.deepEqual(calls, [{ command: "hc", args: ["read", "t9", "--lines", "5"] }]);
+    });
+
+    it("isSurfaceAlive: live/finished/gone/unknown mapping from hc get", () => {
+      const respond = (stdout: string, code = 0, stderr = "") => {
+        __herdrAppTest__.setRunner((command, args) => {
+          calls.push({ command, args });
+          return { code, stdout, stderr };
+        });
+      };
+
+      respond(JSON.stringify({ state: "live" }));
+      assert.equal(isSurfaceAlive("t9"), true);
+      respond(JSON.stringify({ state: "finished" }));
+      assert.equal(isSurfaceAlive("t9"), false);
+      respond(JSON.stringify({ error: { kind: "not_found", message: 'no terminal "t9"' } }), 3);
+      assert.equal(isSurfaceAlive("t9"), false);
+      respond(JSON.stringify({ error: { message: "socket busy" } }), 1);
+      assert.equal(isSurfaceAlive("t9"), null);
+      assert.deepEqual(
+        calls.map((c) => `${c.command} ${c.args.join(" ")}`),
+        Array(4).fill("hc get t9 --json"),
+      );
+    });
+
+    it("closeSurface: hc kill <t>; an already-gone terminal is a no-op", () => {
+      closeSurface("t9");
+      assert.deepEqual(calls, [{ command: "hc", args: ["kill", "t9"] }]);
+
+      calls = [];
+      __herdrAppTest__.setRunner(() => ({
+        code: 3,
+        stdout: JSON.stringify({ error: { kind: "not_found", message: 'no terminal "t9"' } }),
+        stderr: "",
+      }));
+      assert.doesNotThrow(() => closeSurface("t9"));
+    });
+
+    it("closeSurface: throws on other kill failures", () => {
+      __herdrAppTest__.setRunner(() => ({ code: 1, stdout: "", stderr: "kill: permission denied" }));
+      assert.throws(() => closeSurface("t9"), /permission denied/);
+    });
+  });
+});
+
 describe("herdr-native.ts", () => {
   after(() => {
     __herdrNativeTest__.setRunner(null);
@@ -2563,6 +2824,11 @@ describe("herdr-native.ts", () => {
 
     it("is false when the backend is not herdr", () => {
       __herdrNativeTest__.setBackendResolver(() => "cmux");
+      assert.equal(herdrNativeEnabled({}), false);
+    });
+
+    it("is false on the herdrapp backend (herdr-app generation has no native agent API)", () => {
+      __herdrNativeTest__.setBackendResolver(() => "herdrapp");
       assert.equal(herdrNativeEnabled({}), false);
     });
 

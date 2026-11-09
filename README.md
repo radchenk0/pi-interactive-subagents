@@ -42,12 +42,13 @@ pi install git:github.com/HazAT/pi-interactive-subagents
 Supported multiplexers:
 
 - [cmux](https://github.com/manaflow-ai/cmux)
-- [herdr](https://github.com/herdr) (raw panes over a local socket server)
+- [herdr](https://github.com/herdr) (standalone CLI, pre-generation)
+- [Herdr app](https://github.com/herdr) (herdr-app generation, via the `hc`/`herdr-app` CLIs)
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
 
-> **Note:** herdr runs *on top of* tmux (the `TMUX` env is set inside herdr), so detection tries herdr **before** tmux to avoid picking the wrong backend.
+> **Note:** herdr runs *on top of* tmux (the `TMUX` env is set inside herdr), so detection tries herdr **before** tmux to avoid picking the wrong backend. A pi running inside a Herdr app terminal is detected even earlier, via the `HC_TERMINAL_ID` env var (injected by herdr-core), which wins over everything.
 
 Start pi inside one of them:
 
@@ -56,6 +57,8 @@ cmux pi
 # or
 herdr        # then run: pi
 # or
+# run pi inside any Herdr (herdr-app generation) terminal — no wrapper needed
+# or
 tmux new -A -s pi 'pi'
 # or
 zellij --session pi   # then run: pi
@@ -63,7 +66,7 @@ zellij --session pi   # then run: pi
 # just run pi inside WezTerm — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|herdr|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|herdr|herdrapp|tmux|zellij|wezterm` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -75,7 +78,7 @@ Subagent panes are created without stealing keyboard focus (cmux, herdr, tmux). 
 
 ### Herdr native agent API
 
-When running under [herdr](https://herdr.dev), subagents use herdr's server-side agent API instead of screen scraping:
+When running under the standalone [herdr](https://herdr.dev) CLI (pre-generation), subagents use herdr's server-side agent API instead of screen scraping:
 
 - **Completion detection** — `pane wait-output` searches the terminal snapshot and polls server-side for the exit sentinel (no client-side screen-read loop).
 - **Interrupts** — sent via `agent send-keys <pane> esc` (herdr-validated key).
@@ -92,6 +95,18 @@ export PI_SUBAGENT_HERDR_NATIVE=0
 Every native call degrades to the raw pane path (with a one-line warning) if herdr is old or the call fails — subagent results are never affected.
 
 For richer herdr integration (authoritative lifecycle states + native session restore), install herdr's official pi integration: `herdr integration install pi`.
+
+### Herdr (herdr-app generation) — `hc` / `herdr-app`
+
+The native agent API above does not exist in the herdr-app generation — so when pi runs inside a Herdr app terminal, subagents use the raw pane path through the `hc` and `herdr-app` CLIs instead (the native layer stays disabled, zero calls go out):
+
+- **Detection:** the `HC_TERMINAL_ID` env var (injected by herdr-core into every terminal it hosts) plus a healthy `hc ls --json`, cached for the process lifetime. Checked before all other backends — `herdrapp` wins even when `TMUX`/`cmux`/zellij signals are also present.
+- **Spawning:** `herdr-app do pane.split` opens a plain shell beside your pane (your own pane is located via a lazy `herdr-app ls` pane/terminal map); keyboard focus is handed back to your terminal afterwards, so nothing is stolen while a subagent spins up.
+- **Surface identity** is the `hc` terminal address (e.g. `t9`).
+- **Commands:** `hc send <t> <cmd>` types the command and presses Enter, waiting for the pane to accept input — no shell-ready delay needed. **Escape:** `hc keys <t> esc`. **Screens:** `hc read <t> --lines N` returns plain text even when piped, so the `__SUBAGENT_DONE_<n>__` sentinel and the `.exit` sidecar fast path work exactly as on the other backends.
+- **Closing:** `hc kill <t>` ends the terminal's whole process tree, so `subagent_kill` needs no process-info/SIGKILL fallback. Pane/tab/workspace rename is a cosmetic no-op (panes track their program; your space and tab names are left untouched).
+
+`test/herdrapp-live-check.ts` is the optional live check that exercises the exact argv against a running app (run it from any Herdr terminal). The standalone-`herdr` CLI backend from the previous generation is unchanged and still auto-detected via the `herdr` binary.
 
 ## What's Included
 
@@ -369,7 +384,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 - [pi](https://github.com/badlogic/pi-mono) — the coding agent
 - One supported multiplexer:
   - [cmux](https://github.com/manaflow-ai/cmux)
-  - [herdr](https://github.com/herdr)
+  - [herdr](https://github.com/herdr) (standalone CLI or herdr-app generation)
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
@@ -387,7 +402,7 @@ zellij --session pi   # then run: pi
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or herdr, tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or herdr, herdrapp, tmux, zellij, wezterm
 ```
 
 ---
